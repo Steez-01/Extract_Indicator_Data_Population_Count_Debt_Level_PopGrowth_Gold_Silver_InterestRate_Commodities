@@ -1,1 +1,920 @@
 Gold
+"""
+Global Indicator Data Extractor — Multi-Source, 50-Year Daily Data
+==================================================================
+Extracts daily-level economic & financial indicator data going back 50 years.
+
+Architecture mirrors the companion stock-data extractor
+(Extract_ALL_Stock_Data) but targets indicators instead of equities.
+
+Indicator Jobs (Phase 1 — 4 indicators):
+  1. GOLD              — Gold spot price (USD/oz), daily since 1970s
+  2. US_TREASURIES     — US Treasury yields: 1Y, 2Y, 3Y, 5Y, 7Y, 10Y, 20Y, 30Y
+  3. VIX               — CBOE Volatility Index, daily since 1990
+  4. OIL               — WTI Crude + Brent Crude, daily since ~1983
+
+Data Sources (in priority order):
+  • FRED (Federal Reserve Economic Data) — free API, best for yields & rates
+  • Yahoo Finance (yfinance)             — commodities, VIX, bond ETFs
+  • World Bank (wbgapi)                  — annual macro indicators (future phases)
+
+Output: one CSV per indicator job in output/ directory.
+  Row    = one calendar day
+  Cols   = Indicator | Date columns (daily close/value)
+  Format = identical to the stock extractor (transposed wide format)
+
+Run modes:
+  python extract_indicator_data.py                        # all indicators
+  python extract_indicator_data.py --indicator GOLD       # single indicator
+  python extract_indicator_data.py --indicator OIL
+  python extract_indicator_data.py --indicator US_TREASURIES
+  python extract_indicator_data.py --indicator VIX
+  python extract_indicator_data.py --group commodities    # commodity group
+  python extract_indicator_data.py --group rates          # rates & volatility
+  python extract_indicator_data.py --list                 # show all available
+
+FRED API Key:
+  Free — register at https://fred.stlouisfed.org/docs/api/api_key.html
+  Set via environment variable FRED_API_KEY or paste into the script.
+  Without a FRED key, the script falls back to yfinance for everything
+  (less coverage for treasury yields).
+
+Future phases (not yet implemented):
+  5. SILVER             — Silver spot price
+  6. EU_BONDS           — EU sovereign yields (Germany, France, etc.)
+  7. METALS             — Copper, Platinum, Palladium, Aluminum
+  8. RARE_EARTHS        — Rare earth element indices
+  9. SEMICONDUCTOR_PRECURSORS — Silicon wafer / polysilicon prices
+  10. BOND_DEFAULT_RATIO       — Corporate bond default rates (Moody's/S&P)
+  11. CREDIT_DEFAULT_RATIO     — CDS spreads (CDX indices)
+  12. COMPANY_DEFAULT_RATIO    — Business bankruptcy filings
+  13. GOV_DEBT_LEVEL           — Government debt-to-GDP per country
+  14. POPULATION                — Population counts per country
+  15. POPULATION_DEBT           — Household debt per capita
+  16. IMMIGRATION               — Immigration counts per country
+  17. PERCENTAGE_NETWORTH_INVESTED — Household equity allocation
+  18. PERCENTAGE_CASH_NOT_INVESTED — Money market / savings ratios
+  19. WORLD_LEVERAGE_LEVEL       — Global margin debt / leverage
+  20. WORLD_LEVERAGE_RATIO       — Debt-to-equity ratios by country
+"""
+
+import pandas as pd
+import json
+import os
+import sys
+import time
+import logging
+from datetime import datetime, timedelta
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+START_DATE          = "1976-01-01"
+END_DATE            = datetime.today().strftime("%Y-%m-%d")
+OUTPUT_DIR          = "output"
+CACHE_DIR           = "indicator_cache"
+RETRY_ATTEMPTS      = 3
+RETRY_DELAY         = 5
+INTER_INDICATOR_DELAY = 3   # seconds between indicator jobs
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s"
+)
+log = logging.getLogger(__name__)
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ─── FRED API KEY ─────────────────────────────────────────────────────────────
+# Free: https://fred.stlouisfed.org/docs/api/api_key.html
+# Set as environment variable or paste here.
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+
+# ─── DEPENDENCY CHECK & INSTALLATION ─────────────────────────────────────────
+
+def ensure_dependencies():
+    """Check and install required packages."""
+    required = {
+        "yfinance":     "yfinance",
+        "pandas":       "pandas",
+        "fredapi":      "fredapi",
+    }
+    missing = []
+    for import_name, pip_name in required.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pip_name)
+
+    if missing:
+        log.info(f"Installing missing packages: {missing}")
+        import subprocess
+        for pkg in missing:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", pkg,
+                 "--break-system-packages", "-q"]
+            )
+        log.info("Dependencies installed successfully.")
+
+ensure_dependencies()
+
+import yfinance as yf
+try:
+    from fredapi import Fred
+    FRED_AVAILABLE = True
+except ImportError:
+    FRED_AVAILABLE = False
+    log.warning("fredapi not available — FRED data sources will use yfinance fallback")
+
+
+# ─── CACHE LAYER ──────────────────────────────────────────────────────────────
+# Each indicator caches its last successful download to avoid re-fetching
+# unchanged data. Cache key = indicator_name + series_id.
+# Cache stores: {last_fetched, row_count, file_path}
+
+def get_cache_path(indicator_name: str) -> str:
+    return os.path.join(CACHE_DIR, f"{indicator_name}_meta.json")
+
+def load_indicator_cache(indicator_name: str) -> dict:
+    path = get_cache_path(indicator_name)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_indicator_cache(indicator_name: str, meta: dict):
+    path = get_cache_path(indicator_name)
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA SOURCE ADAPTERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── FRED ADAPTER ─────────────────────────────────────────────────────────────
+# FRED provides the gold standard for US economic time series.
+# Free API: up to 120 requests/minute, no daily cap.
+# Series IDs: https://fred.stlouisfed.org/tags/series
+
+def fetch_fred_series(series_id: str, start: str = START_DATE,
+                      end: str = END_DATE, name: str = None) -> pd.Series:
+    """Fetch a single FRED series. Returns a named pd.Series with DatetimeIndex."""
+    if not FRED_AVAILABLE or not FRED_API_KEY:
+        log.warning(f"   FRED unavailable for {series_id} — no API key or fredapi missing")
+        return pd.Series(dtype=float)
+
+    label = name or series_id
+    try:
+        fred = Fred(api_key=FRED_API_KEY)
+        data = fred.get_series(series_id, observation_start=start,
+                               observation_end=end)
+        if data is not None and not data.empty:
+            data.name = label
+            data.index = pd.to_datetime(data.index)
+            # Drop NaN rows (FRED uses '.' for missing)
+            data = data.dropna()
+            log.info(f"   FRED {series_id}: {len(data)} observations "
+                     f"({data.index.min().date()} → {data.index.max().date()})")
+            return data
+        else:
+            log.warning(f"   FRED {series_id}: empty response")
+            return pd.Series(dtype=float, name=label)
+    except Exception as e:
+        log.warning(f"   FRED {series_id} failed: {e}")
+        return pd.Series(dtype=float, name=label)
+
+
+def fetch_fred_multiple(series_dict: dict, start: str = START_DATE,
+                        end: str = END_DATE) -> pd.DataFrame:
+    """Fetch multiple FRED series and combine into a DataFrame.
+
+    series_dict: {display_name: FRED_series_id}
+    Returns: DataFrame with DatetimeIndex, one column per series.
+    """
+    frames = []
+    for display_name, series_id in series_dict.items():
+        s = fetch_fred_series(series_id, start, end, name=display_name)
+        if not s.empty:
+            frames.append(s)
+        time.sleep(0.2)  # gentle rate limiting
+
+    if frames:
+        df = pd.concat(frames, axis=1)
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        return df
+    return pd.DataFrame()
+
+
+# ─── YAHOO FINANCE ADAPTER ───────────────────────────────────────────────────
+# Used for: commodities (gold, silver, oil futures), VIX, bond ETFs
+# Tickers: GC=F (gold), SI=F (silver), CL=F (WTI), BZ=F (Brent), ^VIX
+
+def fetch_yfinance_series(tickers: dict, start: str = START_DATE,
+                          end: str = END_DATE) -> pd.DataFrame:
+    """Fetch multiple Yahoo Finance tickers and return Close prices.
+
+    tickers: {display_name: yf_ticker_symbol}
+    Returns: DataFrame with DatetimeIndex, one column per ticker (display_name).
+    """
+    ticker_list = list(tickers.values())
+    name_map = {v: k for k, v in tickers.items()}  # reverse: symbol → display_name
+
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            data = yf.download(
+                ticker_list, start=start, end=end,
+                auto_adjust=True, progress=False, threads=False
+            )
+            if data.empty:
+                raise ValueError("yfinance returned empty DataFrame")
+
+            # Handle single vs multi-ticker response
+            if isinstance(data.columns, pd.MultiIndex):
+                if "Close" in data.columns.get_level_values(0):
+                    close = data["Close"]
+                else:
+                    close = data
+            else:
+                if len(ticker_list) == 1:
+                    if "Close" in data.columns:
+                        close = data[["Close"]].rename(
+                            columns={"Close": ticker_list[0]})
+                    else:
+                        close = data.iloc[:, :1]
+                        close.columns = [ticker_list[0]]
+                else:
+                    close = data
+
+            # Rename columns from yf symbols to display names
+            close = close.rename(columns=name_map)
+
+            log.info(f"   yfinance: {close.shape[1]} series, "
+                     f"{len(close)} observations "
+                     f"({close.index.min().date()} → {close.index.max().date()})")
+            return close
+
+        except Exception as e:
+            err_str = str(e)
+            if "Too Many Requests" in err_str or "Rate" in err_str:
+                wait = 60 * attempt
+                log.warning(f"   Rate limited — waiting {wait}s (attempt {attempt})")
+                time.sleep(wait)
+            else:
+                log.warning(f"   yfinance attempt {attempt} failed: {e}")
+                if attempt < RETRY_ATTEMPTS:
+                    time.sleep(RETRY_DELAY * attempt)
+
+    log.error("   All yfinance download attempts failed.")
+    return pd.DataFrame()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INDICATOR JOB DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Each job defines:
+#   name          — unique identifier (also used as filename prefix)
+#   description   — human-readable description
+#   group         — for --group filtering (commodities | rates | volatility)
+#   sources       — ordered list of data source configs (first success wins)
+#                   Each source: {type: "fred"|"yfinance", series: {name: id}}
+#   metadata      — extra columns prepended to each row (unit, source, etc.)
+
+INDICATOR_JOBS = [
+
+    # ══════════════════════════════════════════════════════════════
+    # 1. GOLD — Spot price (USD per troy ounce)
+    # ══════════════════════════════════════════════════════════════
+    # FRED:     GOLDAMGBD228NLBM  (London AM fix, daily, 1968-04-01 → present)
+    #           GOLDPMGBD228NLBM  (London PM fix, daily)
+    # yfinance: GC=F              (COMEX gold futures, daily, ~1979 → present)
+    #           GLD               (SPDR Gold ETF, 2004 → present, backup)
+    {
+        "name": "GOLD",
+        "description": "Gold Spot Price — USD per Troy Ounce (London Fix + Futures)",
+        "group": "commodities",
+        "unit": "USD/oz",
+        "frequency": "daily",
+        "sources": [
+            {
+                "type": "fred",
+                "series": {
+                    "Gold_London_AM_Fix_USD":  "GOLDAMGBD228NLBM",
+                    "Gold_London_PM_Fix_USD":  "GOLDPMGBD228NLBM",
+                },
+                "priority": 1,
+                "note": "London Bullion Market Association — AM & PM fixing prices",
+            },
+            {
+                "type": "yfinance",
+                "series": {
+                    "Gold_Futures_COMEX_USD":  "GC=F",
+                    "Gold_ETF_GLD_USD":        "GLD",
+                },
+                "priority": 2,
+                "note": "COMEX gold futures continuous contract + GLD ETF",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Precious Metals",
+            "Region": "Global",
+            "Currency": "USD",
+        },
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # 2. US TREASURIES — Constant Maturity Yields
+    # ══════════════════════════════════════════════════════════════
+    # FRED series: DGS{maturity} — daily, going back to 1962 for 10Y
+    # These are THE definitive source for US Treasury yields.
+    # yfinance has ^TNX (10Y) and ^FVX (5Y) as backup.
+    {
+        "name": "US_TREASURIES",
+        "description": "US Treasury Constant Maturity Yields — 1M to 30Y (Daily %)",
+        "group": "rates",
+        "unit": "percent",
+        "frequency": "daily",
+        "sources": [
+            {
+                "type": "fred",
+                "series": {
+                    "US_Treasury_1M_Yield":   "DGS1MO",
+                    "US_Treasury_3M_Yield":   "DGS3MO",
+                    "US_Treasury_6M_Yield":   "DGS6MO",
+                    "US_Treasury_1Y_Yield":   "DGS1",
+                    "US_Treasury_2Y_Yield":   "DGS2",
+                    "US_Treasury_3Y_Yield":   "DGS3",
+                    "US_Treasury_5Y_Yield":   "DGS5",
+                    "US_Treasury_7Y_Yield":   "DGS7",
+                    "US_Treasury_10Y_Yield":  "DGS10",
+                    "US_Treasury_20Y_Yield":  "DGS20",
+                    "US_Treasury_30Y_Yield":  "DGS30",
+                },
+                "priority": 1,
+                "note": "Federal Reserve H.15 — Constant Maturity Treasury rates",
+            },
+            {
+                "type": "yfinance",
+                "series": {
+                    "US_Treasury_5Y_Yield":   "^FVX",
+                    "US_Treasury_10Y_Yield":  "^TNX",
+                    "US_Treasury_30Y_Yield":  "^TYX",
+                    "US_Treasury_13W_Yield":  "^IRX",
+                },
+                "priority": 2,
+                "note": "CBOE yield indices (backup — fewer maturities)",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Fixed Income",
+            "Region": "United States",
+            "Currency": "USD",
+            "Issuer": "US Department of the Treasury",
+        },
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # 3. VIX — CBOE Volatility Index
+    # ══════════════════════════════════════════════════════════════
+    # FRED:     VIXCLS  (daily, 1990-01-02 → present)
+    # yfinance: ^VIX    (daily, same range)
+    # Also fetch related: MOVE (bond vol), VVIX (vol of vol)
+    {
+        "name": "VIX",
+        "description": "CBOE Volatility Index (VIX) + Related Volatility Measures",
+        "group": "volatility",
+        "unit": "index points",
+        "frequency": "daily",
+        "sources": [
+            {
+                "type": "fred",
+                "series": {
+                    "VIX_CBOE":  "VIXCLS",
+                },
+                "priority": 1,
+                "note": "FRED mirror of CBOE VIX — official daily close",
+            },
+            {
+                "type": "yfinance",
+                "series": {
+                    "VIX_CBOE":            "^VIX",
+                    "VIX9D_9Day":          "^VIX9D",
+                    "VIX3M_3Month":        "^VIX3M",
+                    "VIX6M_6Month":        "^VIX6M",
+                    "VVIX_Vol_of_Vol":     "^VVIX",
+                },
+                "priority": 2,
+                "note": "CBOE VIX term structure: 9D, 1M (VIX), 3M, 6M + VVIX",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Volatility",
+            "Region": "United States",
+            "Underlying": "S&P 500 Index Options",
+        },
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # 4. OIL — Crude Oil Prices (WTI + Brent)
+    # ══════════════════════════════════════════════════════════════
+    # FRED:     DCOILWTICO (WTI daily, 1986 → present)
+    #           DCOILBRENTEU (Brent daily, 1987 → present)
+    # yfinance: CL=F (WTI front month), BZ=F (Brent front month)
+    #           USO (WTI ETF), BNO (Brent ETF)
+    {
+        "name": "OIL",
+        "description": "Crude Oil Prices — WTI & Brent (USD per barrel, daily)",
+        "group": "commodities",
+        "unit": "USD/barrel",
+        "frequency": "daily",
+        "sources": [
+            {
+                "type": "fred",
+                "series": {
+                    "WTI_Crude_USD_bbl":     "DCOILWTICO",
+                    "Brent_Crude_USD_bbl":   "DCOILBRENTEU",
+                },
+                "priority": 1,
+                "note": "EIA via FRED — official daily spot prices",
+            },
+            {
+                "type": "yfinance",
+                "series": {
+                    "WTI_Crude_Futures_USD":   "CL=F",
+                    "Brent_Crude_Futures_USD":  "BZ=F",
+                    "Natural_Gas_Futures_USD":  "NG=F",
+                    "Heating_Oil_Futures_USD":  "HO=F",
+                },
+                "priority": 2,
+                "note": "NYMEX/ICE futures continuous contracts",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Energy Commodities",
+            "Region": "Global",
+            "Currency": "USD",
+        },
+    },
+
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FUTURE PHASE INDICATOR STUBS (ready to activate)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FUTURE_INDICATOR_JOBS = [
+
+    {
+        "name": "SILVER",
+        "description": "Silver Spot Price — USD per Troy Ounce",
+        "group": "commodities",
+        "unit": "USD/oz",
+        "frequency": "daily",
+        "sources": [
+            {"type": "fred",     "series": {"Silver_USD": "SLVPRUSD"}, "priority": 1},
+            {"type": "yfinance", "series": {"Silver_Futures": "SI=F", "Silver_ETF_SLV": "SLV"}, "priority": 2},
+        ],
+        "metadata": {"Asset Class": "Precious Metals", "Region": "Global", "Currency": "USD"},
+    },
+
+    {
+        "name": "METALS",
+        "description": "Base & Precious Metals — Copper, Platinum, Palladium, Aluminum",
+        "group": "commodities",
+        "unit": "various",
+        "frequency": "daily",
+        "sources": [
+            {"type": "yfinance", "series": {
+                "Copper_Futures_USD_lb": "HG=F",
+                "Platinum_Futures_USD":  "PL=F",
+                "Palladium_Futures_USD": "PA=F",
+            }, "priority": 1},
+            {"type": "fred", "series": {
+                "Copper_USD_lb":   "PCOPPUSDM",
+                "Aluminum_USD_mt": "PALUMUSDM",
+            }, "priority": 2, "note": "Monthly — less granular but longer history"},
+        ],
+        "metadata": {"Asset Class": "Industrial & Precious Metals", "Region": "Global"},
+    },
+
+    {
+        "name": "EU_BONDS",
+        "description": "European Government Bond Yields — DE, FR, IT, ES, UK (1Y, 5Y, 10Y)",
+        "group": "rates",
+        "unit": "percent",
+        "frequency": "daily",
+        "sources": [
+            {"type": "fred", "series": {
+                "Germany_10Y_Yield":  "IRLTLT01DEM156N",
+                "France_10Y_Yield":   "IRLTLT01FRM156N",
+                "Italy_10Y_Yield":    "IRLTLT01ITM156N",
+                "Spain_10Y_Yield":    "IRLTLT01ESM156N",
+                "UK_10Y_Yield":       "IRLTLT01GBM156N",
+            }, "priority": 1},
+        ],
+        "metadata": {"Asset Class": "Sovereign Fixed Income", "Region": "Europe", "Currency": "Local"},
+    },
+
+    {
+        "name": "GOV_DEBT_LEVEL",
+        "description": "Government Debt-to-GDP Ratio per Country (Annual, 40 countries)",
+        "group": "macro",
+        "unit": "percent of GDP",
+        "frequency": "annual",
+        "sources": [
+            {"type": "fred", "series": {
+                "US_Debt_to_GDP":      "GFDEGDQ188S",
+                "Japan_Debt_to_GDP":   "JPNGDGDPBPGDP",
+                "Germany_Debt_to_GDP": "DEUGDGDPBPGDP",
+                "UK_Debt_to_GDP":      "GBRGDGDPBPGDP",
+                "France_Debt_to_GDP":  "FRAGDGDPBPGDP",
+                "Italy_Debt_to_GDP":   "ITAGDGDPBPGDP",
+                "China_Debt_to_GDP":   "CHNGDGDPBPGDP",
+                "Brazil_Debt_to_GDP":  "BRAGDGDPBPGDP",
+                "India_Debt_to_GDP":   "INDGDGDPBPGDP",
+                "Canada_Debt_to_GDP":  "CANGDGDPBPGDP",
+            }, "priority": 1},
+        ],
+        "metadata": {"Asset Class": "Macro", "Region": "Global"},
+    },
+
+    {
+        "name": "POPULATION",
+        "description": "Population Counts per Country (Annual, 40+ countries)",
+        "group": "macro",
+        "unit": "persons",
+        "frequency": "annual",
+        "sources": [
+            {"type": "fred", "series": {
+                "US_Population":       "POPTOTUSA647NWDB",
+                "China_Population":    "POPTOTCNA647NWDB",
+                "India_Population":    "POPTOTINA647NWDB",
+                "Japan_Population":    "POPTOTJPA647NWDB",
+                "Germany_Population":  "POPTOTDEA647NWDB",
+                "UK_Population":       "POPTOTGBA647NWDB",
+                "France_Population":   "POPTOTFRA647NWDB",
+                "Brazil_Population":   "POPTOTBRA647NWDB",
+                "Canada_Population":   "POPTOTCAA647NWDB",
+                "Australia_Population":"POPTOTAUA647NWDB",
+            }, "priority": 1},
+        ],
+        "metadata": {"Asset Class": "Demographics", "Region": "Global"},
+    },
+
+    {
+        "name": "RARE_EARTHS",
+        "description": "Rare Earth Element Price Indices",
+        "group": "commodities",
+        "unit": "USD/kg",
+        "frequency": "daily",
+        "sources": [
+            {"type": "yfinance", "series": {
+                "REMX_Rare_Earth_ETF": "REMX",
+                "MP_Materials":        "MP",
+            }, "priority": 1, "note": "ETF proxies — direct RE prices not freely available daily"},
+        ],
+        "metadata": {"Asset Class": "Specialty Commodities", "Region": "Global"},
+    },
+
+    {
+        "name": "SEMICONDUCTOR_PRECURSORS",
+        "description": "Semiconductor Supply Chain Proxies — Wafer/Equipment Indices",
+        "group": "commodities",
+        "unit": "USD",
+        "frequency": "daily",
+        "sources": [
+            {"type": "yfinance", "series": {
+                "SOXX_Semiconductor_ETF": "SOXX",
+                "SMH_Semiconductor_ETF":  "SMH",
+                "ASML_Holding":           "ASML",
+                "Applied_Materials":      "AMAT",
+                "Lam_Research":           "LRCX",
+                "Tokyo_Electron":         "8035.T",
+            }, "priority": 1, "note": "Equity proxies — direct silicon/wafer prices not freely available"},
+        ],
+        "metadata": {"Asset Class": "Technology Supply Chain", "Region": "Global"},
+    },
+
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INDICATOR GROUPS (for --group flag)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+GROUPS = {
+    "commodities": ["GOLD", "OIL"],
+    "rates":       ["US_TREASURIES"],
+    "volatility":  ["VIX"],
+    "all_phase1":  ["GOLD", "US_TREASURIES", "VIX", "OIL"],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE EXTRACTION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_indicator(job: dict) -> pd.DataFrame:
+    """Extract data for one indicator job using its prioritised source chain.
+
+    Tries each source in priority order. For each source type:
+      fred     → fetch_fred_multiple()
+      yfinance → fetch_yfinance_series()
+
+    Merges all successful sources into a single DataFrame (outer join on date).
+    Returns the combined DataFrame, or empty if all sources fail.
+    """
+    name = job["name"]
+    desc = job["description"]
+    log.info(f"\n{'='*60}")
+    log.info(f"EXTRACTING: {name}")
+    log.info(f"  {desc}")
+    log.info(f"  Period: {START_DATE} → {END_DATE}")
+    log.info(f"{'='*60}")
+
+    all_frames = []
+    source_notes = []
+
+    # Sort sources by priority
+    sources = sorted(job["sources"], key=lambda s: s.get("priority", 99))
+
+    for src in sources:
+        src_type  = src["type"]
+        series    = src["series"]
+        note      = src.get("note", "")
+
+        log.info(f"\n  Source: {src_type} (priority {src.get('priority', '?')})")
+        if note:
+            log.info(f"    {note}")
+
+        df = pd.DataFrame()
+
+        if src_type == "fred":
+            if not FRED_API_KEY:
+                log.warning(f"    Skipping FRED source — no API key set. "
+                            f"Set FRED_API_KEY env var or paste into script.")
+                continue
+            df = fetch_fred_multiple(series, START_DATE, END_DATE)
+
+        elif src_type == "yfinance":
+            df = fetch_yfinance_series(series, START_DATE, END_DATE)
+
+        else:
+            log.warning(f"    Unknown source type: {src_type}")
+            continue
+
+        if not df.empty:
+            all_frames.append(df)
+            source_notes.append(f"{src_type}: {list(series.keys())}")
+            log.info(f"    ✓ Got {df.shape[1]} series × {len(df)} days")
+        else:
+            log.warning(f"    ✗ No data from {src_type}")
+
+    if not all_frames:
+        log.error(f"  No data obtained for {name} from any source. Skipping.")
+        return pd.DataFrame()
+
+    # Merge all source frames on date (outer join keeps all dates)
+    combined = all_frames[0]
+    for df in all_frames[1:]:
+        # Don't duplicate columns — only add new ones
+        new_cols = [c for c in df.columns if c not in combined.columns]
+        if new_cols:
+            combined = combined.join(df[new_cols], how="outer")
+
+    combined = combined.sort_index()
+
+    # Summary stats
+    date_range = f"{combined.index.min().date()} → {combined.index.max().date()}"
+    total_days = len(combined)
+    total_series = combined.shape[1]
+    non_null_pct = (combined.notna().sum().sum() /
+                    (total_days * total_series) * 100) if total_days > 0 else 0
+
+    log.info(f"\n  COMBINED: {total_series} series × {total_days} days")
+    log.info(f"  Date range: {date_range}")
+    log.info(f"  Data completeness: {non_null_pct:.1f}%")
+
+    # Per-series stats
+    for col in combined.columns:
+        s = combined[col].dropna()
+        if len(s) > 0:
+            log.info(f"    {col}: {len(s)} obs, "
+                     f"{s.index.min().date()} → {s.index.max().date()}, "
+                     f"latest={s.iloc[-1]:.4f}" if isinstance(s.iloc[-1], float)
+                     else f"    {col}: {len(s)} obs")
+
+    return combined
+
+
+def save_indicator(job: dict, df: pd.DataFrame):
+    """Save indicator data in the same format as the stock extractor.
+
+    Output layout (transposed wide format, matching stock script):
+      Row index = Series name (e.g. "Gold_London_AM_Fix_USD")
+      Columns   = Metadata cols + date columns (YYYY-MM-DD)
+
+    This format lets users load the CSV and directly compare with stock CSVs.
+    """
+    if df.empty:
+        return
+
+    name = job["name"]
+    metadata = job.get("metadata", {})
+
+    # Transpose: series become rows, dates become columns
+    df_wide = df.transpose()
+    df_wide.columns = pd.to_datetime(df_wide.columns).strftime("%Y-%m-%d")
+
+    # Prepend metadata columns
+    meta_cols = pd.DataFrame(index=df_wide.index)
+    meta_cols["Description"] = job["description"]
+    meta_cols["Unit"]        = job.get("unit", "")
+    meta_cols["Frequency"]   = job.get("frequency", "daily")
+    for k, v in metadata.items():
+        meta_cols[k] = v
+
+    df_out = pd.concat([meta_cols, df_wide], axis=1)
+
+    # Generate filename
+    n_series = df.shape[1]
+    n_days   = len(df)
+    filename = os.path.join(OUTPUT_DIR,
+                            f"{name}_{n_series}_series_{n_days}_days.csv")
+
+    df_out.to_csv(filename, index_label="Series")
+
+    n_meta = len(meta_cols.columns)
+    log.info(f"\n  ✓ SAVED: {filename}")
+    log.info(f"    {n_series} series × {n_days} days + {n_meta} metadata columns")
+
+    # Update cache metadata
+    save_indicator_cache(name, {
+        "last_fetched": datetime.today().strftime("%Y-%m-%d %H:%M:%S"),
+        "series_count": n_series,
+        "day_count":    n_days,
+        "file_path":    filename,
+        "date_range":   f"{df.index.min().date()} → {df.index.max().date()}",
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUMMARY REPORT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def print_summary(results: list):
+    """Print a summary table of all extracted indicators."""
+    log.info(f"\n{'='*70}")
+    log.info(f"EXTRACTION SUMMARY")
+    log.info(f"{'='*70}")
+    log.info(f"{'Indicator':<25} {'Series':>8} {'Days':>8} {'Date Range':<30} {'Status'}")
+    log.info(f"{'-'*25} {'-'*8} {'-'*8} {'-'*30} {'-'*10}")
+
+    for r in results:
+        status = "✓ OK" if r["success"] else "✗ FAIL"
+        log.info(f"{r['name']:<25} {r['series']:>8} {r['days']:>8} "
+                 f"{r['date_range']:<30} {status}")
+
+    successes = sum(1 for r in results if r["success"])
+    log.info(f"\n  Total: {successes}/{len(results)} indicators extracted successfully")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN MODES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_all(jobs: list):
+    """Extract all indicators sequentially."""
+    results = []
+    total = len(jobs)
+
+    for idx, job in enumerate(jobs, 1):
+        log.info(f"\n[{idx}/{total}] Starting {job['name']}...")
+        df = extract_indicator(job)
+        if not df.empty:
+            save_indicator(job, df)
+            results.append({
+                "name":       job["name"],
+                "success":    True,
+                "series":     df.shape[1],
+                "days":       len(df),
+                "date_range": f"{df.index.min().date()} → {df.index.max().date()}",
+            })
+        else:
+            results.append({
+                "name":       job["name"],
+                "success":    False,
+                "series":     0,
+                "days":       0,
+                "date_range": "N/A",
+            })
+
+        if idx < total:
+            log.info(f"   Pausing {INTER_INDICATOR_DELAY}s before next indicator...")
+            time.sleep(INTER_INDICATOR_DELAY)
+
+    print_summary(results)
+
+
+def run_group(group_name: str):
+    """Run a named group of indicators."""
+    group_name = group_name.lower()
+    if group_name not in GROUPS:
+        log.error(f"Unknown group '{group_name}'. Available: {list(GROUPS.keys())}")
+        return
+    names = GROUPS[group_name]
+    jobs = [j for j in INDICATOR_JOBS if j["name"] in names]
+    log.info(f"Group '{group_name}': {len(jobs)} indicators → {names}")
+    run_all(jobs)
+
+
+def run_single(indicator_name: str):
+    """Run a single named indicator."""
+    # Check phase 1 jobs
+    matches = [j for j in INDICATOR_JOBS
+               if j["name"].lower() == indicator_name.lower()]
+    # Also check future jobs (allow early testing)
+    if not matches:
+        matches = [j for j in FUTURE_INDICATOR_JOBS
+                   if j["name"].lower() == indicator_name.lower()]
+    if not matches:
+        all_names = ([j["name"] for j in INDICATOR_JOBS] +
+                     [j["name"] for j in FUTURE_INDICATOR_JOBS])
+        log.error(f"Indicator '{indicator_name}' not found.")
+        log.info(f"Available: {all_names}")
+        return
+
+    df = extract_indicator(matches[0])
+    if not df.empty:
+        save_indicator(matches[0], df)
+
+
+def list_indicators():
+    """Display all available indicators."""
+    print(f"\n{'='*70}")
+    print(f"AVAILABLE INDICATORS")
+    print(f"{'='*70}")
+    print(f"\nPhase 1 (Active):")
+    print(f"{'-'*50}")
+    for j in INDICATOR_JOBS:
+        sources = ", ".join(s["type"] for s in j["sources"])
+        print(f"  {j['name']:<25} {j['group']:<15} [{sources}]")
+        print(f"    {j['description']}")
+
+    print(f"\nFuture Phases (Stubs — ready to activate):")
+    print(f"{'-'*50}")
+    for j in FUTURE_INDICATOR_JOBS:
+        sources = ", ".join(s["type"] for s in j["sources"])
+        print(f"  {j['name']:<25} {j['group']:<15} [{sources}]")
+        print(f"    {j['description']}")
+
+    print(f"\nGroups (for --group flag):")
+    for g, names in GROUPS.items():
+        print(f"  {g:<15} → {names}")
+
+    print(f"\nFRED API Key: {'SET ✓' if FRED_API_KEY else 'NOT SET — set FRED_API_KEY env var'}")
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Global Indicator Data Extractor — 50-Year Daily Data",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python extract_indicator_data.py                           # all 4 indicators\n"
+            "  python extract_indicator_data.py --indicator GOLD          # gold only\n"
+            "  python extract_indicator_data.py --indicator OIL           # oil only\n"
+            "  python extract_indicator_data.py --indicator US_TREASURIES # yields only\n"
+            "  python extract_indicator_data.py --indicator VIX           # VIX only\n"
+            "  python extract_indicator_data.py --indicator SILVER        # future phase\n"
+            "  python extract_indicator_data.py --group commodities       # gold + oil\n"
+            "  python extract_indicator_data.py --group rates             # treasuries\n"
+            "  python extract_indicator_data.py --list                    # show all available\n"
+            "\n"
+            "FRED API key (free): https://fred.stlouisfed.org/docs/api/api_key.html\n"
+            "  export FRED_API_KEY='your-key-here'\n"
+        )
+    )
+    parser.add_argument("--indicator", type=str, default=None,
+                        help="Run for a single indicator (e.g. --indicator GOLD)")
+    parser.add_argument("--group", type=str, default=None,
+                        help="Run an indicator group: commodities | rates | volatility")
+    parser.add_argument("--list", action="store_true",
+                        help="List all available indicators and exit")
+    args = parser.parse_args()
+
+    if args.list:
+        list_indicators()
+    elif args.indicator:
+        run_single(args.indicator)
+    elif args.group:
+        run_group(args.group)
+    else:
+        run_all(INDICATOR_JOBS)
