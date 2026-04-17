@@ -1,1 +1,1409 @@
-Company Default Ratio
+"""
+Global Indicator Data Extractor v6 — 23 Active Indicators, 50-Year Daily
+=========================================================================
+
+23 indicators, ~370 series. Complete economic & financial coverage.
+
+  #  Indicator             Group         Category
+  1  GOLD                  commodities   Precious metals
+  2  BONDS                 rates         US+EU+UK+JP sovereign yields
+  3  VIX                   volatility    Equity volatility
+  4  OIL                   commodities   Energy
+  5  SILVER                commodities   Precious metals
+  6  METALS                commodities   Base & precious metals
+  7  INTEREST_RATES        rates         Central bank policy rates
+  8  CREDIT_SPREADS        rates         Credit risk / default
+  9  GOV_DEBT_LEVEL        macro         Government fiscal position
+  10 WORLD_LEVERAGE        macro         Money supply / credit
+  11 RARE_EARTHS           commodities   Strategic minerals
+  12 SEMICONDUCTORS        commodities   Tech supply chain
+  13 DEMOGRAPHICS          macro         Population & migration
+  14 HOUSEHOLD_ALLOCATION  macro         Equity vs cash allocation
+  15 FOREX                 rates         Currency exchange rates
+  16 INFLATION             macro         CPI, PPI, breakevens
+  17 REAL_ESTATE           macro         Housing prices, starts, REITs
+  18 EMPLOYMENT            macro         Jobless claims, unemployment
+  19 AGRICULTURE           commodities   Wheat, corn, soy, coffee etc
+  20 GDP_GROWTH            macro         Quarterly GDP 20 countries       (v6 NEW)
+  21 EQUITY_INDICES        indices       S&P500, FTSE, DAX, Nikkei etc    (v6 NEW)
+  22 CONSUMER_SENTIMENT    macro         Confidence, PMI, LEI             (v6 NEW)
+  23 SHIPPING_TRADE        macro         Baltic Dry, trade balance        (v6 NEW)
+
+Run:
+  python extract_indicator_data.py                      # all 23
+  python extract_indicator_data.py --group phase6       # 4 newest
+  python extract_indicator_data.py --group commodities   # 7 indicators
+  python extract_indicator_data.py --group macro         # 11 indicators
+  python extract_indicator_data.py --group indices       # equity benchmarks
+  python extract_indicator_data.py --indicator GDP_GROWTH
+  python extract_indicator_data.py --list
+
+FRED API key (free): https://fred.stlouisfed.org/docs/api/api_key.html
+  export FRED_API_KEY='your-key'
+"""
+
+import pandas as pd, json, os, sys, time, logging
+from datetime import datetime
+
+START_DATE = "1976-01-01"
+END_DATE   = datetime.today().strftime("%Y-%m-%d")
+OUTPUT_DIR = "output"
+CACHE_DIR  = "indicator_cache"
+RETRY_ATTEMPTS = 3
+RETRY_DELAY    = 5
+INTER_INDICATOR_DELAY = 3
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+
+def ensure_dependencies():
+    missing = []
+    for imp, pip in {"yfinance":"yfinance","pandas":"pandas","fredapi":"fredapi"}.items():
+        try: __import__(imp)
+        except ImportError: missing.append(pip)
+    if missing:
+        import subprocess
+        for p in missing:
+            subprocess.check_call([sys.executable,"-m","pip","install",p,"--break-system-packages","-q"])
+
+ensure_dependencies()
+import yfinance as yf
+try:
+    from fredapi import Fred; FRED_AVAILABLE = True
+except ImportError:
+    FRED_AVAILABLE = False
+
+# --- Cache ----------------------------------------------------------------
+def get_cache_path(n): return os.path.join(CACHE_DIR, f"{n}_meta.json")
+def load_indicator_cache(n):
+    p = get_cache_path(n)
+    return json.load(open(p)) if os.path.exists(p) else {}
+def save_indicator_cache(n, m):
+    json.dump(m, open(get_cache_path(n),"w"), indent=2)
+
+# --- FRED adapter ---------------------------------------------------------
+def fetch_fred_series(sid, start=START_DATE, end=END_DATE, name=None):
+    if not FRED_AVAILABLE or not FRED_API_KEY: return pd.Series(dtype=float)
+    label = name or sid
+    try:
+        d = Fred(api_key=FRED_API_KEY).get_series(sid, observation_start=start, observation_end=end)
+        if d is not None and not d.empty:
+            d.name = label; d.index = pd.to_datetime(d.index); d = d.dropna()
+            log.info(f"   FRED {sid}: {len(d)} obs ({d.index.min().date()} -> {d.index.max().date()})")
+            return d
+    except Exception as e: log.warning(f"   FRED {sid}: {e}")
+    return pd.Series(dtype=float, name=label)
+
+def fetch_fred_multiple(sd, start=START_DATE, end=END_DATE):
+    frames = []
+    for nm, sid in sd.items():
+        s = fetch_fred_series(sid, start, end, name=nm)
+        if not s.empty: frames.append(s)
+        time.sleep(0.2)
+    if frames:
+        df = pd.concat(frames, axis=1); df.index = pd.to_datetime(df.index); return df.sort_index()
+    return pd.DataFrame()
+
+# --- yfinance adapter -----------------------------------------------------
+def fetch_yfinance_series(tickers, start=START_DATE, end=END_DATE):
+    tl = list(tickers.values()); nm = {v:k for k,v in tickers.items()}
+    for attempt in range(1, RETRY_ATTEMPTS+1):
+        try:
+            data = yf.download(tl, start=start, end=end, auto_adjust=True, progress=False, threads=False)
+            if data.empty: raise ValueError("empty")
+            if isinstance(data.columns, pd.MultiIndex):
+                close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+            else:
+                if len(tl)==1:
+                    close = (data[["Close"]].rename(columns={"Close":tl[0]})
+                             if "Close" in data.columns
+                             else data.iloc[:,:1].set_axis([tl[0]], axis=1))
+                else: close = data
+            close = close.rename(columns=nm)
+            log.info(f"   yfinance: {close.shape[1]} series, {len(close)} obs "
+                     f"({close.index.min().date()} -> {close.index.max().date()})")
+            return close
+        except Exception as e:
+            if "Too Many Requests" in str(e) or "Rate" in str(e): time.sleep(60*attempt)
+            else:
+                log.warning(f"   yfinance attempt {attempt}: {e}")
+                if attempt < RETRY_ATTEMPTS: time.sleep(RETRY_DELAY*attempt)
+    return pd.DataFrame()
+
+
+# ===========================================================================
+# 15 ACTIVE INDICATOR JOBS
+# ===========================================================================
+
+INDICATOR_JOBS = [
+
+    # 1. GOLD
+    {"name": "GOLD", "description": "Gold Spot Price — USD/oz (London Fix + Futures)",
+     "group": "commodities", "unit": "USD/oz", "frequency": "daily",
+     "sources": [
+         {"type": "fred", "series": {
+             "Gold_London_AM_Fix": "GOLDAMGBD228NLBM",
+             "Gold_London_PM_Fix": "GOLDPMGBD228NLBM",
+         }, "priority": 1, "note": "LBMA fixing — daily since 1968"},
+         {"type": "yfinance", "series": {
+             "Gold_Futures_COMEX": "GC=F", "Gold_ETF_GLD": "GLD",
+         }, "priority": 2, "note": "COMEX futures + GLD ETF"},
+     ], "metadata": {"Asset Class": "Precious Metals", "Region": "Global", "Currency": "USD"}},
+
+    # 2. BONDS — merged US + EU + UK + JP sovereign yields
+    {"name": "BONDS", "description": "Global Sovereign Bond Yields — US 1M-30Y + EU/UK/JP 10Y+3M (Daily %)",
+     "group": "rates", "unit": "percent / USD", "frequency": "daily",
+     "sources": [
+         {"type": "fred", "series": {
+             "US_Treasury_1M": "DGS1MO", "US_Treasury_3M": "DGS3MO",
+             "US_Treasury_6M": "DGS6MO", "US_Treasury_1Y": "DGS1",
+             "US_Treasury_2Y": "DGS2",   "US_Treasury_3Y": "DGS3",
+             "US_Treasury_5Y": "DGS5",   "US_Treasury_7Y": "DGS7",
+             "US_Treasury_10Y": "DGS10", "US_Treasury_20Y": "DGS20",
+             "US_Treasury_30Y": "DGS30",
+             "Germany_10Y": "IRLTLT01DEM156N", "France_10Y": "IRLTLT01FRM156N",
+             "Italy_10Y":   "IRLTLT01ITM156N", "Spain_10Y":  "IRLTLT01ESM156N",
+             "UK_10Y":      "IRLTLT01GBM156N", "Netherlands_10Y": "IRLTLT01NLM156N",
+             "Belgium_10Y": "IRLTLT01BEM156N", "Austria_10Y": "IRLTLT01ATM156N",
+             "Japan_10Y":   "IRLTLT01JPM156N",
+             "Germany_3M": "IR3TIB01DEM156N", "France_3M": "IR3TIB01FRM156N",
+             "Italy_3M":   "IR3TIB01ITM156N", "Spain_3M":  "IR3TIB01ESM156N",
+             "UK_3M":      "IR3TIB01GBM156N", "UK_20Y":    "IRLTLT02GBM156N",
+         }, "priority": 1, "note": "US H.15 yields (1962->) + OECD EU/UK/JP (1970s->). 26 series."},
+         {"type": "yfinance", "series": {
+             "US_5Y_idx": "^FVX",  "US_10Y_idx": "^TNX",
+             "US_30Y_idx": "^TYX", "US_13W_idx": "^IRX",
+             "TLT_20Y_ETF": "TLT", "IEF_7_10Y_ETF": "IEF",
+             "SHY_1_3Y_ETF": "SHY", "GOVT_All_ETF": "GOVT",
+             "EU_Gov_1_3Y": "IBGS.L", "EU_Gov_7_10Y": "IBGL.L",
+             "EU_Gov_15_30Y": "IBGX.L",
+             "UK_Gilt_0_5Y": "IGLS.L", "UK_Gilt_All": "IGLT.L",
+         }, "priority": 2, "note": "CBOE yield indices + US/EU/UK bond ETFs"},
+     ], "metadata": {"Asset Class": "Sovereign Fixed Income",
+                     "Region": "US + Europe + UK + Japan"}},
+
+    # 3. VIX
+    {"name": "VIX", "description": "CBOE Volatility Index + Term Structure",
+     "group": "volatility", "unit": "index points", "frequency": "daily",
+     "sources": [
+         {"type": "fred", "series": {"VIX_CBOE": "VIXCLS"}, "priority": 1},
+         {"type": "yfinance", "series": {
+             "VIX_CBOE": "^VIX", "VIX9D": "^VIX9D", "VIX3M": "^VIX3M",
+             "VIX6M": "^VIX6M", "VVIX": "^VVIX",
+         }, "priority": 2, "note": "VIX term structure + VVIX"},
+     ], "metadata": {"Asset Class": "Volatility", "Region": "US"}},
+
+    # 4. OIL
+    {"name": "OIL", "description": "Crude Oil + Energy — WTI, Brent, NatGas, Heating Oil",
+     "group": "commodities", "unit": "USD/barrel", "frequency": "daily",
+     "sources": [
+         {"type": "fred", "series": {
+             "WTI_Spot": "DCOILWTICO", "Brent_Spot": "DCOILBRENTEU",
+         }, "priority": 1, "note": "EIA daily spot prices"},
+         {"type": "yfinance", "series": {
+             "WTI_Futures": "CL=F", "Brent_Futures": "BZ=F",
+             "NatGas_Futures": "NG=F", "HeatingOil_Futures": "HO=F",
+         }, "priority": 2, "note": "NYMEX/ICE futures"},
+     ], "metadata": {"Asset Class": "Energy", "Region": "Global", "Currency": "USD"}},
+
+    # 5. SILVER
+    {"name": "SILVER", "description": "Silver Spot Price — USD/oz (London Fix + Futures)",
+     "group": "commodities", "unit": "USD/oz", "frequency": "daily",
+     "sources": [
+         {"type": "fred", "series": {"Silver_London_Fix": "SLVPRUSD"},
+          "priority": 1, "note": "LBMA — daily since 1968"},
+         {"type": "yfinance", "series": {
+             "Silver_Futures_COMEX": "SI=F", "Silver_ETF_SLV": "SLV",
+         }, "priority": 2},
+     ], "metadata": {"Asset Class": "Precious Metals", "Region": "Global", "Currency": "USD"}},
+
+    # 6. METALS
+    {"name": "METALS", "description": "Base & Precious Metals — Cu, Pt, Pd, Al, Ni, Zn, Sn, Fe",
+     "group": "commodities", "unit": "various", "frequency": "daily+monthly",
+     "sources": [
+         {"type": "yfinance", "series": {
+             "Copper_Futures": "HG=F", "Platinum_Futures": "PL=F",
+             "Palladium_Futures": "PA=F",
+         }, "priority": 1, "note": "COMEX/NYMEX daily futures"},
+         {"type": "fred", "series": {
+             "Copper_mt_Mo": "PCOPPUSDM", "Aluminum_mt_Mo": "PALUMUSDM",
+             "Nickel_mt_Mo": "PNICKUSDM", "Zinc_mt_Mo": "PZINCUSDM",
+             "Tin_mt_Mo": "PTINUSDM",     "IronOre_mt_Mo": "PIORECRUSDM",
+             "Platinum_oz_Mo": "PPLTMUSDM","Palladium_oz_Mo": "PPALDUSDM",
+         }, "priority": 2, "note": "IMF/WB monthly since 1960"},
+     ], "metadata": {"Asset Class": "Metals", "Region": "Global", "Currency": "USD"}},
+
+    # 7. INTEREST_RATES
+    {"name": "INTEREST_RATES",
+     "description": "Central Bank Policy Rates — Fed, ECB, BOE, BOJ + SOFR, Prime, Mortgage",
+     "group": "rates", "unit": "percent", "frequency": "daily",
+     "sources": [
+         {"type": "fred", "series": {
+             "Fed_Funds_Effective": "DFF", "Fed_Funds_Upper": "DFEDTARU",
+             "Fed_Funds_Lower": "DFEDTARL", "SOFR_Overnight": "SOFR",
+             "Overnight_BankFunding": "OBFR", "US_Prime_Rate": "DPRIME",
+             "US_30Y_Mortgage": "MORTGAGE30US", "US_15Y_Mortgage": "MORTGAGE15US",
+             "ECB_Main_Refi": "ECBMRRFR", "ECB_Deposit": "ECBDFR",
+             "ECB_EuroShortTerm": "ECBESTRVOLWGTTRMDMNRT",
+             "BOE_BankRate": "BOERUKM", "Japan_ShortTerm": "IRSTCI01JPM156N",
+             "Canada_Policy": "IRSTCB01CAM156N", "Australia_Cash": "IRSTCB01AUM156N",
+         }, "priority": 1, "note": "Fed Funds daily since 1954 (72 years)"},
+         {"type": "yfinance", "series": {
+             "BIL_TBill_ETF": "BIL", "SOFR_ETF": "SOFR",
+         }, "priority": 2},
+     ], "metadata": {"Asset Class": "Central Bank Rates",
+                     "Region": "US, Eurozone, UK, Japan, Canada, Australia"}},
+
+    # 8. CREDIT_SPREADS
+    {"name": "CREDIT_SPREADS",
+     "description": "Credit Spreads & Default Risk — ICE BofA OAS (AAA-CCC) + Stress Indicators",
+     "group": "rates", "unit": "percent/bps", "frequency": "daily",
+     "sources": [
+         {"type": "fred", "series": {
+             "US_IG_OAS": "BAMLC0A0CM",     "US_HY_OAS": "BAMLH0A0HYM2",
+             "US_AAA_OAS": "BAMLC0A1CAAA",  "US_AA_OAS": "BAMLC0A2CAA",
+             "US_A_OAS": "BAMLC0A3CA",      "US_BBB_OAS": "BAMLC0A4CBBB",
+             "US_CCC_OAS": "BAMLH0A3HYC",   "EM_Corporate_OAS": "BAMLEMCBPIOAS",
+             "TED_Spread": "TEDRATE",
+             "US_10Y_minus_2Y": "T10Y2Y", "US_10Y_minus_3M": "T10Y3M",
+         }, "priority": 1, "note": "ICE BofA OAS (since 1996) + yield curve spreads"},
+         {"type": "yfinance", "series": {
+             "HYG_HY_Corp": "HYG", "JNK_HY_Corp": "JNK",
+             "LQD_IG_Corp": "LQD", "EMB_EM_Bond": "EMB",
+             "BKLN_SeniorLoan": "BKLN", "ANGL_FallenAngels": "ANGL",
+         }, "priority": 2, "note": "Credit bond ETFs (2002-2012 onward)"},
+     ], "metadata": {"Asset Class": "Credit Spreads", "Region": "US + EM"}},
+
+    # 9. GOV_DEBT_LEVEL
+    {"name": "GOV_DEBT_LEVEL",
+     "description": "Government Debt-to-GDP — 20 Countries (Quarterly/Annual %)",
+     "group": "macro", "unit": "% of GDP", "frequency": "quarterly",
+     "sources": [
+         {"type": "fred", "series": {
+             "US_FedDebt_GDP": "GFDEGDQ188S", "US_FedDebt_Total_M": "GFDEBTN",
+             "Japan_Debt_GDP": "JPNGGXWDGG01GDPPT", "Germany_Debt_GDP": "DEUGGXWDGG01GDPPT",
+             "UK_Debt_GDP": "GBRGGXWDGG01GDPPT", "France_Debt_GDP": "FRAGGXWDGG01GDPPT",
+             "Italy_Debt_GDP": "ITAGGXWDGG01GDPPT", "Canada_Debt_GDP": "CANGGXWDGG01GDPPT",
+             "Australia_Debt_GDP": "AUSGGXWDGG01GDPPT", "Brazil_Debt_GDP": "BRAGGXWDGG01GDPPT",
+             "India_Debt_GDP": "INDGGXWDGG01GDPPT", "China_Debt_GDP": "CHNGGXWDGG01GDPPT",
+             "Spain_Debt_GDP": "ESPGGXWDGG01GDPPT", "Mexico_Debt_GDP": "MEXGGXWDGG01GDPPT",
+             "SKorea_Debt_GDP": "KORGGXWDGG01GDPPT", "Netherlands_Debt_GDP": "NLDGGXWDGG01GDPPT",
+             "Switzerland_Debt_GDP": "CHEGGXWDGG01GDPPT", "Sweden_Debt_GDP": "SWEGGXWDGG01GDPPT",
+             "Belgium_Debt_GDP": "BELGGXWDGG01GDPPT", "Austria_Debt_GDP": "AUTGGXWDGG01GDPPT",
+             "Norway_Debt_GDP": "NORGGXWDGG01GDPPT",
+         }, "priority": 1, "note": "US since 1966 + OECD since ~1995 for 20 countries"},
+         {"type": "yfinance", "series": {
+             "TLT_LongBond": "TLT", "IEF_MedBond": "IEF", "SHY_ShortBond": "SHY",
+         }, "priority": 2, "note": "Treasury ETFs as fiscal-stress proxies"},
+     ], "metadata": {"Asset Class": "Macro — Fiscal", "Region": "Global (20 countries)"}},
+
+    # 10. WORLD_LEVERAGE
+    {"name": "WORLD_LEVERAGE",
+     "description": "Financial Leverage — M1/M2, Bank Credit, Consumer Debt, Margin",
+     "group": "macro", "unit": "various", "frequency": "monthly+",
+     "sources": [
+         {"type": "fred", "series": {
+             "US_M2": "M2SL", "US_M1": "M1SL",
+             "US_BankCredit": "TOTBKCR", "US_CI_Loans": "BUSLOANS",
+             "US_BankAssets": "TLAACBW027SBOG", "US_ConsumerCredit": "TOTALSL",
+             "US_HouseholdDebt_GDP": "HDTGPDUSQ163N", "US_DebtService": "TDSP",
+             "China_M2": "MABMM201CNM189N", "Japan_M2": "MABMM201JPM189S",
+             "Eurozone_M2": "MABMM201EZM189S",
+         }, "priority": 1, "note": "US M2 since 1959, bank credit since 1973"},
+         {"type": "yfinance", "series": {
+             "SSO_2x_SP500": "SSO", "QLD_2x_NASDAQ": "QLD",
+             "XLF_Financials": "XLF", "KRE_RegionalBanks": "KRE",
+         }, "priority": 2, "note": "Leveraged + financial sector ETFs"},
+     ], "metadata": {"Asset Class": "Macro — Leverage", "Region": "US+China+Japan+EZ"}},
+
+    # 11. RARE_EARTHS
+    {"name": "RARE_EARTHS",
+     "description": "Rare Earths & Strategic Minerals — ETFs + Miners (REMX, MP, Lynas, Li, U)",
+     "group": "commodities", "unit": "USD", "frequency": "daily",
+     "sources": [
+         {"type": "yfinance", "series": {
+             "REMX_RareEarth_ETF": "REMX", "MP_Materials": "MP",
+             "Lynas_RareEarths": "LYC.AX",
+             "LIT_Lithium_ETF": "LIT", "URA_Uranium_ETF": "URA",
+             "COPX_CopperMiners": "COPX", "PICK_GlobalMining": "PICK",
+         }, "priority": 1, "note": "ETF + miner proxies since ~2010"},
+     ], "metadata": {"Asset Class": "Rare Earths & Strategic Minerals", "Region": "Global"}},
+
+
+    # ==================================================================
+    # ==================================================================
+    # ===  PHASE 4 — 4 NEW INDICATORS  ================================
+    # ==================================================================
+    # ==================================================================
+
+    # ==================================================================
+    # 12. SEMICONDUCTORS — SEMICONDUCTOR_PRECURSORS from repo
+    # ==================================================================
+    # The semiconductor supply chain has no freely available daily spot
+    # price for raw materials (silicon wafers, polysilicon, photoresist).
+    # Best approach: equipment makers + foundry stocks + semi ETFs.
+    # Their revenues and stock prices are directly driven by wafer starts,
+    # utilisation rates, and upstream material costs.
+    #
+    # yfinance coverage:
+    #   SOXX  iShares Semiconductor ETF (2001->)  — broad US semi index
+    #   SMH   VanEck Semiconductor ETF (2000->)    — top-heavy (NVDA, TSM, AVGO)
+    #   TSM   TSMC ADR (~1997->)                   — world's largest foundry
+    #   ASML  ASML (~1995->)                       — monopoly on EUV lithography
+    #   AMAT  Applied Materials (~1985->)           — largest equipment maker
+    #   LRCX  Lam Research (~1990->)                — etch & deposition equipment
+    #   KLAC  KLA Corp (~1997->)                    — inspection & metrology
+    #   8035.T Tokyo Electron (~1999->)             — Japan's largest equip maker
+    #   INTC  Intel (~1980->)                       — longest-history semi stock
+    #   002371.SZ Naura Technology                   — China semi equipment
+    #
+    # FRED: no direct semi data, but:
+    #   PCU33443344 PPI for Semiconductor Manufacturing (monthly since 2003)
+    #   IPG3344S    Industrial Production: Semiconductors (monthly since 2012)
+    {
+        "name": "SEMICONDUCTORS",
+        "description": "Semiconductor Supply Chain — Equipment, Foundries, ETFs (Daily since ~1985)",
+        "group": "commodities",
+        "unit": "USD (equity/ETF price)",
+        "frequency": "daily",
+        "sources": [
+            {
+                "type": "yfinance",
+                "series": {
+                    # Broad semi ETFs
+                    "SOXX_iShares_Semi_ETF":  "SOXX",
+                    "SMH_VanEck_Semi_ETF":    "SMH",
+                    # Foundries
+                    "TSM_TSMC_Foundry":       "TSM",
+                    "INTC_Intel":             "INTC",
+                    # Equipment makers (upstream supply chain)
+                    "ASML_EUV_Lithography":   "ASML",
+                    "AMAT_Applied_Materials": "AMAT",
+                    "LRCX_Lam_Research":      "LRCX",
+                    "KLAC_KLA_Inspection":    "KLAC",
+                    "TEL_Tokyo_Electron":     "8035.T",
+                },
+                "priority": 1,
+                "note": "Semi ETFs (2000->) + equipment makers (1985->). "
+                        "Intel since ~1980 is longest semi equity history. "
+                        "ASML monopolises EUV lithography — key bottleneck indicator.",
+            },
+            {
+                "type": "fred",
+                "series": {
+                    # Producer Price Index for semiconductor manufacturing
+                    "PPI_Semiconductor_Mfg": "PCU33443344",
+                    # Industrial production: semiconductors
+                    "IP_Semiconductors":     "IPG3344S",
+                },
+                "priority": 2,
+                "note": "PPI since 2003 (monthly) + industrial production since 2012. "
+                        "PPI rising = wafer/material cost inflation.",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Semiconductor Supply Chain",
+            "Region": "Global (US, Taiwan, Netherlands, Japan)",
+            "Currency": "USD / JPY",
+            "Source": "Equipment + foundry equities via yfinance, PPI/IP via FRED",
+        },
+    },
+
+    # ==================================================================
+    # 13. DEMOGRAPHICS — Population + Immigration merged
+    # ==================================================================
+    # Matches repo files: "Population Counts per Country around the world"
+    #                     "Immigration Count Per Country Through Time"
+    #
+    # Both are demographic indicators — grouped into one file.
+    #
+    # FRED — World Bank population series:
+    #   POPTOT{CC}647NWDB — total population, annual, since 1960
+    #   SPPOPGROW{CC} — population growth rate (% annual), since 1961
+    #   SMPOPNETM{CC} — net migration (5-year estimates from WB/UN)
+    #
+    # Covers the same 20 countries as the stock extractor + GOV_DEBT.
+    # Growth rates are more useful than absolute counts for trend analysis.
+    #
+    # yfinance: no population data, but country ETFs serve as economic
+    # size proxies (markets grow with population + productivity)
+    {
+        "name": "DEMOGRAPHICS",
+        "description": "Population & Immigration — 20 Countries: Counts, Growth Rate, Net Migration (Annual)",
+        "group": "macro",
+        "unit": "persons / percent / net migrants",
+        "frequency": "annual",
+        "sources": [
+            {
+                "type": "fred",
+                "series": {
+                    # ── POPULATION COUNTS (annual since 1960) ──────────
+                    "US_Population":          "POPTOTUSA647NWDB",
+                    "China_Population":       "POPTOTCNA647NWDB",
+                    "India_Population":       "POPTOTINA647NWDB",
+                    "Japan_Population":       "POPTOTJPA647NWDB",
+                    "Germany_Population":     "POPTOTDEA647NWDB",
+                    "UK_Population":          "POPTOTGBA647NWDB",
+                    "France_Population":      "POPTOTFRA647NWDB",
+                    "Brazil_Population":      "POPTOTBRA647NWDB",
+                    "Canada_Population":      "POPTOTCAA647NWDB",
+                    "Australia_Population":   "POPTOTAUA647NWDB",
+                    "SKorea_Population":      "POPTOTKOR647NWDB",
+                    "Mexico_Population":      "POPTOTMEX647NWDB",
+                    "Indonesia_Population":   "POPTOTIDN647NWDB",
+                    "Turkey_Population":      "POPTOTTUR647NWDB",
+                    "Spain_Population":       "POPTOTESP647NWDB",
+                    "Netherlands_Population": "POPTOTNLD647NWDB",
+                    "Switzerland_Population": "POPTOTCHE647NWDB",
+                    "Sweden_Population":      "POPTOTSWE647NWDB",
+                    "Singapore_Population":   "POPTOTSGP647NWDB",
+                    "Thailand_Population":    "POPTOTTHA647NWDB",
+                    # ── POPULATION GROWTH RATES (% annual since 1961) ──
+                    "US_PopGrowth_Pct":       "SPPOPGROWUSA",
+                    "China_PopGrowth_Pct":    "SPPOPGROWCHN",
+                    "India_PopGrowth_Pct":    "SPPOPGROWIND",
+                    "Japan_PopGrowth_Pct":    "SPPOPGROWJPN",
+                    "Germany_PopGrowth_Pct":  "SPPOPGROWDEU",
+                    "UK_PopGrowth_Pct":       "SPPOPGROWGBR",
+                    "Brazil_PopGrowth_Pct":   "SPPOPGROWBRA",
+                    "Canada_PopGrowth_Pct":   "SPPOPGROWCAN",
+                    "Australia_PopGrowth_Pct":"SPPOPGROWAUS",
+                    "Mexico_PopGrowth_Pct":   "SPPOPGROWMEX",
+                    # ── NET MIGRATION (5-year WB/UN estimates) ─────────
+                    "US_NetMigration":        "SMPOPNETMUSA",
+                    "Germany_NetMigration":   "SMPOPNETMDEU",
+                    "UK_NetMigration":        "SMPOPNETMGBR",
+                    "Canada_NetMigration":    "SMPOPNETMCAN",
+                    "Australia_NetMigration": "SMPOPNETMAUS",
+                    "Japan_NetMigration":     "SMPOPNETMJPN",
+                    "France_NetMigration":    "SMPOPNETMFRA",
+                    "Spain_NetMigration":     "SMPOPNETMESP",
+                    "Italy_NetMigration":     "SMPOPNETMITA",
+                    "Brazil_NetMigration":    "SMPOPNETMBRA",
+                },
+                "priority": 1,
+                "note": "World Bank via FRED — 20 countries population (since 1960), "
+                        "growth rates (since 1961), net migration (5-year estimates). "
+                        "40 series total.",
+            },
+            {
+                "type": "yfinance",
+                "series": {
+                    # Country ETFs as economic-size proxies
+                    "EWJ_Japan_ETF":     "EWJ",
+                    "EWG_Germany_ETF":   "EWG",
+                    "FXI_China_ETF":     "FXI",
+                    "EWZ_Brazil_ETF":    "EWZ",
+                    "INDA_India_ETF":    "INDA",
+                },
+                "priority": 2,
+                "note": "Country equity ETFs (daily since ~1996). "
+                        "Markets grow with population + productivity.",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Demographics — Population & Migration",
+            "Region": "Global (20 countries)",
+            "Currency": "N/A",
+            "Source": "World Bank / UN via FRED + country ETFs via yfinance",
+        },
+    },
+
+    # ==================================================================
+    # 14. HOUSEHOLD_ALLOCATION — Networth Invested + Cash Not Invested
+    # ==================================================================
+    # Matches repo files: "Percentage Networth Invested"
+    #                     "Percentage cash not yet invested"
+    #
+    # These are two sides of the same coin — how households split their
+    # assets between equities (invested) and cash/savings (not invested).
+    # Grouped into one indicator for direct comparison.
+    #
+    # FRED — Federal Reserve Z.1 Financial Accounts + related:
+    #   BOGZ1FL153064476Q  Households equity share of financial assets (Q, 1952->)
+    #     This is THE definitive measure of US equity allocation.
+    #     When it peaks → market top (dot-com 2000, 2021).
+    #   MMMFFAQ027S  Money market fund assets (Q, 1974->)
+    #   WRMFSL       Retail money funds (weekly, 1975->)
+    #   SAVINGS      Savings deposits at commercial banks (monthly, 1959->)
+    #   PSAVERT      Personal savings rate (monthly, 1959->)
+    #     Rises in recessions (fear), falls in booms (confidence).
+    #   BOGZ1FL154090005Q  Total household financial assets (Q, 1952->)
+    #   BOGZ1FL153020005Q  Households total deposits (Q, 1952->)
+    #   WDDNS          Demand deposits (weekly, 1975->)
+    #
+    # The cash vs equity balance is a powerful contrarian signal:
+    #   High cash % → pessimism → bullish for future returns
+    #   High equity % → euphoria → bearish for future returns
+    {
+        "name": "HOUSEHOLD_ALLOCATION",
+        "description": "Household Asset Allocation — Equity vs Cash/Savings (Quarterly + Monthly)",
+        "group": "macro",
+        "unit": "billions USD / percent",
+        "frequency": "quarterly + monthly",
+        "sources": [
+            {
+                "type": "fred",
+                "series": {
+                    # ── EQUITY ALLOCATION (% Networth Invested) ────────
+                    "HH_Equity_Share_Pct":    "BOGZ1FL153064476Q",
+                    "HH_Total_FinAssets":     "BOGZ1FL154090005Q",
+                    # ── CASH / NOT INVESTED ────────────────────────────
+                    "MoneyMarket_Fund_Assets": "MMMFFAQ027S",
+                    "Retail_MoneyFunds_Wk":   "WRMFSL",
+                    "Savings_Deposits_Mo":    "SAVINGS",
+                    "HH_Total_Deposits":      "BOGZ1FL153020005Q",
+                    "Demand_Deposits_Wk":     "WDDNS",
+                    # ── SAVINGS RATE ───────────────────────────────────
+                    "Personal_Savings_Rate":  "PSAVERT",
+                },
+                "priority": 1,
+                "note": "Fed Z.1 equity share (quarterly since 1952) — the definitive "
+                        "measure of US household equity allocation. "
+                        "Money market/savings since 1959-1975. "
+                        "Personal savings rate (monthly since 1959).",
+            },
+            {
+                "type": "yfinance",
+                "series": {
+                    # Proxies for aggregate equity/cash allocation flows
+                    "SPY_SP500":          "SPY",
+                    "BIL_TBill_ETF":      "BIL",
+                    "SHV_ShortTreasury":  "SHV",
+                    "SPAXX_MoneyMkt":     "SPAXX",
+                },
+                "priority": 2,
+                "note": "SPY (equity demand proxy) vs BIL/SHV (cash proxy). "
+                        "When BIL assets grow faster than SPY → risk-off.",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Macro — Household Asset Allocation",
+            "Region": "United States",
+            "Currency": "USD",
+            "Source": "Federal Reserve Z.1 Financial Accounts via FRED + ETFs",
+        },
+    },
+
+    # ==================================================================
+    # 15. FOREX — Major Currency Exchange Rates
+    # ==================================================================
+    # NEW — not in original repo stubs but essential for a 40-country
+    # dataset. The stock extractor covers 40 markets in local currency;
+    # users need FX rates to convert returns to a common base.
+    #
+    # FRED — H.10 Foreign Exchange Rates:
+    #   DEXJPUS   JPY/USD   (daily since 1971-01-04 — 55 years!)
+    #   DEXUSEU   USD/EUR   (daily since 1999-01-04 — Euro inception)
+    #   DEXUSUK   USD/GBP   (daily since 1971-01-04)
+    #   DEXCAUS   CAD/USD   (daily since 1971-01-04)
+    #   DEXSZUS   CHF/USD   (daily since 1971-01-04)
+    #   DEXUSAL   AUD/USD   (daily since 1971-01-04)
+    #   DEXKOUS   KRW/USD   (daily since 1981)
+    #   DEXBZUS   BRL/USD   (daily since 1995)
+    #   DEXINUS   INR/USD   (daily since 1973)
+    #   DEXMXUS   MXN/USD   (daily since 1993)
+    #   DEXSIUS   SGD/USD   (daily since 1981)
+    #   DEXSFUS   ZAR/USD   (daily since 1971)
+    #   DEXNOUS   NOK/USD   (daily since 1971)
+    #   DEXSDUS   SEK/USD   (daily since 1971)
+    #   DEXDNUS   DKK/USD   (daily since 1971)
+    #   DTWEXBGS  Trade-weighted USD Index (broad, daily since 2006)
+    #
+    # yfinance:
+    #   DX-Y.NYB  US Dollar Index (ICE) — since ~1985
+    #   Major pairs as =X tickers
+    {
+        "name": "FOREX",
+        "description": "Major Currency Exchange Rates — 16 Pairs + USD Index (Daily since 1971)",
+        "group": "rates",
+        "unit": "exchange rate",
+        "frequency": "daily",
+        "sources": [
+            {
+                "type": "fred",
+                "series": {
+                    # Major G10 currencies vs USD
+                    "JPYUSD":  "DEXJPUS",     # Yen per USD (since 1971)
+                    "USDEUR":  "DEXUSEU",     # USD per Euro (since 1999)
+                    "USDGBP":  "DEXUSUK",     # USD per GBP (since 1971)
+                    "CADUSD":  "DEXCAUS",     # CAD per USD (since 1971)
+                    "CHFUSD":  "DEXSZUS",     # CHF per USD (since 1971)
+                    "AUDUSD":  "DEXUSAL",     # AUD per USD (since 1971)
+                    "NOKUSD":  "DEXNOUS",     # NOK per USD (since 1971)
+                    "SEKUSD":  "DEXSDUS",     # SEK per USD (since 1971)
+                    "DKKUSD":  "DEXDNUS",     # DKK per USD (since 1971)
+                    # Major EM currencies vs USD
+                    "KRWUSD":  "DEXKOUS",     # Won per USD (since 1981)
+                    "BRLUSD":  "DEXBZUS",     # Real per USD (since 1995)
+                    "INRUSD":  "DEXINUS",     # Rupee per USD (since 1973)
+                    "MXNUSD":  "DEXMXUS",     # Peso per USD (since 1993)
+                    "SGDUSD":  "DEXSIUS",     # SGD per USD (since 1981)
+                    "ZARUSD":  "DEXSFUS",     # Rand per USD (since 1971)
+                    # Trade-weighted USD index
+                    "USD_TradeWeighted_Broad": "DTWEXBGS",
+                },
+                "priority": 1,
+                "note": "Fed H.10 daily FX rates. JPY/GBP/CHF/AUD/NOK/SEK/DKK/ZAR "
+                        "since 1971 (55 years). EUR since 1999. EM since 1981-1995.",
+            },
+            {
+                "type": "yfinance",
+                "series": {
+                    "DXY_Dollar_Index":  "DX-Y.NYB",
+                    "EURUSD":            "EURUSD=X",
+                    "GBPUSD":            "GBPUSD=X",
+                    "USDJPY":            "JPY=X",
+                    "USDCNY":            "CNY=X",
+                    "USDTWD":            "TWD=X",
+                    "USDTHB":            "THB=X",
+                    "USDIDR":            "IDR=X",
+                    "USDTRY":            "TRY=X",
+                    "USDPLN":            "PLN=X",
+                    "USDHUF":            "HUF=X",
+                    "USDCZK":            "CZK=X",
+                    "USDARS":            "ARS=X",
+                },
+                "priority": 2,
+                "note": "DXY index + EM pairs not on FRED (CNY, TWD, THB, IDR, "
+                        "TRY, PLN, HUF, CZK, ARS). Covers all 40 stock-extractor countries.",
+            },
+        ],
+        "metadata": {
+            "Asset Class": "Foreign Exchange",
+            "Region": "Global (30+ currencies)",
+            "Currency": "vs USD",
+            "Source": "Federal Reserve H.10 via FRED + yfinance FX pairs",
+        },
+    },
+
+
+    # ==================================================================
+    # ==================================================================
+    # ===  PHASE 5 — 4 NEW INDICATORS  ================================
+    # ==================================================================
+    # ==================================================================
+
+    # ==================================================================
+    # 16. INFLATION — CPI, PPI, Breakeven Rates, TIPS
+    # ==================================================================
+    # The single most important macro indicator that was missing.
+    #
+    # FRED — daily breakeven inflation rates:
+    #   T5YIE    5-Year breakeven inflation rate  (daily since 2003)
+    #   T10YIE   10-Year breakeven inflation rate (daily since 2003)
+    #   T5YIFR   5-Year 5-Year forward inflation expectation (daily since 2003)
+    #     These are market-implied: TIPS yield subtracted from nominal Treasury
+    #
+    # FRED — monthly CPI/PPI:
+    #   CPIAUCSL    US CPI All Urban Consumers (monthly since 1947 — 79 years!)
+    #   CPILFESL    US Core CPI (ex food & energy, monthly since 1957)
+    #   CPIENGSL    US CPI Energy component
+    #   CPIMEDSL    US CPI Medical Care
+    #   PPIACO      US PPI All Commodities (monthly since 1913!)
+    #   PCEPILFE    PCE Core Price Index (Fed's preferred, monthly since 1959)
+    #   FPCPITOTLZGUSA  US CPI annual inflation rate (since 1960)
+    #   International CPI:
+    #   FPCPITOTLZGJPN  Japan CPI inflation rate
+    #   FPCPITOTLZGDEU  Germany CPI inflation rate
+    #   FPCPITOTLZGGBR  UK CPI inflation rate
+    #   FPCPITOTLZGCHN  China CPI inflation rate
+    #   FPCPITOTLZGBRA  Brazil CPI inflation rate
+    #   CP0000EZ19M086NEST  Eurozone HICP (harmonised CPI)
+    #
+    # yfinance — TIPS / inflation-linked ETFs:
+    #   TIP   iShares TIPS Bond ETF (2003->)
+    #   SCHP  Schwab TIPS ETF (2010->)
+    #   STIP  iShares 0-5Y TIPS ETF (2010->)
+    #   VTIP  Vanguard Short-Term TIPS (2012->)
+    #   CPI   IQ Real Return ETF
+    #   DBC   Invesco DB Commodity Index (inflation hedge proxy)
+    {"name": "INFLATION",
+     "description": "Inflation — US/EU/JP/UK/CN CPI + Breakevens + TIPS + PPI (Daily+Monthly since 1947)",
+     "group": "macro", "unit": "percent / index", "frequency": "daily + monthly",
+     "sources": [
+         {"type": "fred", "series": {
+             # Daily breakeven inflation (market-implied)
+             "US_5Y_Breakeven":     "T5YIE",
+             "US_10Y_Breakeven":    "T10YIE",
+             "US_5Y5Y_Forward":     "T5YIFR",
+             # Monthly US CPI
+             "US_CPI_AllUrban":     "CPIAUCSL",
+             "US_CPI_Core":         "CPILFESL",
+             "US_CPI_Energy":       "CPIENGSL",
+             "US_CPI_Medical":      "CPIMEDSL",
+             # Monthly US PPI & PCE
+             "US_PPI_AllCommodities": "PPIACO",
+             "US_PCE_Core":         "PCEPILFE",
+             # Annual inflation rates — international
+             "US_CPI_YoY":          "FPCPITOTLZGUSA",
+             "Japan_CPI_YoY":       "FPCPITOTLZGJPN",
+             "Germany_CPI_YoY":     "FPCPITOTLZGDEU",
+             "UK_CPI_YoY":          "FPCPITOTLZGGBR",
+             "China_CPI_YoY":       "FPCPITOTLZGCHN",
+             "Brazil_CPI_YoY":      "FPCPITOTLZGBRA",
+             "Eurozone_HICP":       "CP0000EZ19M086NEST",
+         }, "priority": 1,
+          "note": "Breakevens daily since 2003. US CPI monthly since 1947 (79 years!). "
+                  "PPI since 1913. International CPI annual since 1960."},
+         {"type": "yfinance", "series": {
+             "TIP_TIPS_ETF":       "TIP",
+             "SCHP_TIPS_ETF":      "SCHP",
+             "STIP_ShortTIPS_ETF": "STIP",
+             "DBC_Commodity_Idx":  "DBC",
+             "GSG_Commodity_ETF":  "GSG",
+         }, "priority": 2,
+          "note": "TIPS ETFs (2003->) + commodity ETFs as inflation hedges"},
+     ], "metadata": {"Asset Class": "Macro — Inflation",
+                     "Region": "US + Eurozone + Japan + UK + China + Brazil"}},
+
+    # ==================================================================
+    # 17. REAL_ESTATE — Housing Prices, Starts, REITs
+    # ==================================================================
+    # Housing is the world's largest asset class (~$380T globally vs
+    # ~$110T for equities). Critical for wealth effect + credit cycle.
+    #
+    # FRED — US housing data (exceptional depth):
+    #   CSUSHPINSA   Case-Shiller US National Home Price Index (monthly since 1987)
+    #   CSUSHPISA    Case-Shiller US National (seasonally adjusted)
+    #   SPCS20RSA    Case-Shiller 20-City Composite (monthly since 2000)
+    #   MSPUS        Median Sales Price US Homes (quarterly since 1963)
+    #   HOUST        Housing Starts (monthly since 1959 — 67 years!)
+    #   HOUST1F      Housing Starts: Single-Family
+    #   PERMIT       New Private Housing Permits (monthly since 1960)
+    #   USSTHPI      FHFA House Price Index (quarterly since 1991)
+    #   MORTGAGE30US Already in INTEREST_RATES — no duplicate
+    #   EXHOSLUSM495S Existing Home Sales (monthly since 1999)
+    #   MSACSR       Monthly Supply of Houses (months inventory, since 1963)
+    #
+    # yfinance — REIT / housing ETFs:
+    #   VNQ   Vanguard Real Estate ETF (2004->)  — US REITs
+    #   IYR   iShares US Real Estate (2000->)
+    #   XLRE  Real Estate Select Sector SPDR (2015->)
+    #   REM   iShares Mortgage Real Estate (2007->)
+    #   VNQI  Vanguard International Real Estate (2010->)
+    #   XHB   SPDR S&P Homebuilders (2006->)
+    #   ITB   iShares US Home Construction (2006->)
+    {"name": "REAL_ESTATE",
+     "description": "Real Estate — Case-Shiller, Housing Starts, Permits, REIT ETFs (Monthly since 1959)",
+     "group": "macro", "unit": "index / thousands / USD", "frequency": "monthly + daily",
+     "sources": [
+         {"type": "fred", "series": {
+             "CaseShiller_National":     "CSUSHPINSA",
+             "CaseShiller_National_SA":  "CSUSHPISA",
+             "CaseShiller_20City":       "SPCS20RSA",
+             "Median_HomePrice_US":      "MSPUS",
+             "Housing_Starts_Total":     "HOUST",
+             "Housing_Starts_SingleFam": "HOUST1F",
+             "Building_Permits":         "PERMIT",
+             "FHFA_HousePriceIndex":     "USSTHPI",
+             "Existing_HomeSales":       "EXHOSLUSM495S",
+             "Housing_Inventory_Months": "MSACSR",
+         }, "priority": 1,
+          "note": "Housing Starts since 1959 (67 years). Case-Shiller since 1987. "
+                  "Median home price since 1963. Inventory/sales since 1963/1999."},
+         {"type": "yfinance", "series": {
+             "VNQ_US_REIT_ETF":       "VNQ",
+             "IYR_US_RealEstate":     "IYR",
+             "XLRE_RealEstate_SPDR":  "XLRE",
+             "REM_Mortgage_REIT":     "REM",
+             "VNQI_Intl_RealEstate":  "VNQI",
+             "XHB_Homebuilders":      "XHB",
+             "ITB_HomeConstruction":  "ITB",
+         }, "priority": 2,
+          "note": "REIT + homebuilder ETFs (2000-2015 onward). "
+                  "VNQ/IYR track US commercial REITs. XHB/ITB track homebuilders."},
+     ], "metadata": {"Asset Class": "Real Estate & Housing",
+                     "Region": "US + International (VNQI)", "Currency": "USD"}},
+
+    # ==================================================================
+    # 18. EMPLOYMENT — Jobless Claims, Unemployment, Labor Market
+    # ==================================================================
+    # The labor market is the best real-time recession indicator.
+    # Initial claims (weekly) turns before GDP does.
+    #
+    # FRED — US labor market (best in the world for depth):
+    #   ICSA         Initial Jobless Claims (weekly since 1967 — 59 years!)
+    #   CCSA         Continued Claims (weekly since 1967)
+    #   UNRATE       US Unemployment Rate (monthly since 1948 — 78 years!)
+    #   U6RATE       U6 Underemployment Rate (monthly since 1994)
+    #   PAYEMS       Total Nonfarm Payrolls (monthly since 1939 — 87 years!)
+    #   CIVPART      Labor Force Participation Rate (monthly since 1948)
+    #   AWHMAN       Avg Weekly Hours: Manufacturing (monthly since 1939)
+    #   CES0500000003 Avg Hourly Earnings: Private (monthly since 2006)
+    #   JTSJOL       Job Openings: JOLTS (monthly since 2001)
+    #   International unemployment:
+    #   LRHUTTTTJPM156S  Japan unemployment rate
+    #   LRHUTTTTDEP156S  Germany unemployment rate (since ~1991)
+    #   LRHUTTTTGBM156S  UK unemployment rate
+    #   LRUN74TTEZA156S  Eurozone unemployment rate
+    #   LRHUTTTTCAM156S  Canada unemployment rate
+    #
+    # yfinance: employment-sensitive sector ETFs
+    #   XLI   Industrials (cyclical, job-creation sensitive)
+    #   XLY   Consumer Discretionary
+    #   ARKK  Innovation (tech employment proxy)
+    {"name": "EMPLOYMENT",
+     "description": "Labor Market — Jobless Claims, Unemployment, Payrolls, Participation (Weekly+Monthly since 1939)",
+     "group": "macro", "unit": "thousands / percent / persons", "frequency": "weekly + monthly",
+     "sources": [
+         {"type": "fred", "series": {
+             # Weekly claims (leading indicator)
+             "Initial_Claims_Weekly":   "ICSA",
+             "Continued_Claims_Weekly": "CCSA",
+             # Monthly US labor market
+             "US_Unemployment_Rate":    "UNRATE",
+             "US_U6_Underemployment":   "U6RATE",
+             "US_Nonfarm_Payrolls":     "PAYEMS",
+             "US_LaborForce_Participation": "CIVPART",
+             "US_AvgWeeklyHrs_Mfg":    "AWHMAN",
+             "US_AvgHourlyEarnings":    "CES0500000003",
+             "US_JobOpenings_JOLTS":    "JTSJOL",
+             # International unemployment rates
+             "Japan_Unemployment":      "LRHUTTTTJPM156S",
+             "Germany_Unemployment":    "LRHUTTTTDEP156S",
+             "UK_Unemployment":         "LRHUTTTTGBM156S",
+             "Eurozone_Unemployment":   "LRUN74TTEZA156S",
+             "Canada_Unemployment":     "LRHUTTTTCAM156S",
+         }, "priority": 1,
+          "note": "Weekly claims since 1967. Unemployment since 1948. Payrolls since 1939 (87 years!). "
+                  "International unemployment monthly since ~1991."},
+         {"type": "yfinance", "series": {
+             "XLI_Industrials_ETF":   "XLI",
+             "XLY_ConsDisc_ETF":      "XLY",
+             "XLP_ConsStaples_ETF":   "XLP",
+         }, "priority": 2,
+          "note": "Sector ETFs sensitive to employment cycle. "
+                  "XLI/XLY outperform when jobs grow; XLP outperforms in recession."},
+     ], "metadata": {"Asset Class": "Macro — Labor Market",
+                     "Region": "US + Japan + Germany + UK + Eurozone + Canada"}},
+
+    # ==================================================================
+    # 19. AGRICULTURE — Crop & Soft Commodity Futures
+    # ==================================================================
+    # Completes the commodity coverage: energy (OIL), metals (METALS),
+    # precious (GOLD/SILVER), strategic (RARE_EARTHS/SEMICONDUCTORS),
+    # and now agricultural commodities.
+    #
+    # yfinance — CBOT/ICE/NYMEX agricultural futures:
+    #   ZW=F   Wheat        (CBOT, USD/bushel, daily since ~1998)
+    #   ZC=F   Corn         (CBOT, USD/bushel, daily since ~1998)
+    #   ZS=F   Soybeans     (CBOT, USD/bushel, daily since ~1998)
+    #   KC=F   Coffee       (ICE, USD/lb, daily since ~1998)
+    #   SB=F   Sugar #11    (ICE, USD/lb, daily since ~1998)
+    #   CT=F   Cotton #2    (ICE, USD/lb, daily since ~1998)
+    #   CC=F   Cocoa        (ICE, USD/mt, daily since ~1998)
+    #   LE=F   Live Cattle  (CME, USD/lb, daily since ~2000)
+    #   HE=F   Lean Hogs    (CME, USD/lb, daily since ~2000)
+    #   OJ=F   Orange Juice (ICE, USD/lb, daily since ~1998)
+    #
+    # FRED — FAO/World Bank food price indices:
+    #   PFOODINDEXM    Global Food Price Index (monthly since 1992)
+    #   PWHEAUSDM      Wheat, US HRW (monthly since 1960 — 66 years!)
+    #   PMAIZMTUSDM    Maize/Corn (monthly since 1960)
+    #   PSOYBUSDM      Soybeans (monthly since 1960)
+    #   PCOFFOTMUSDM   Coffee, Other Milds (monthly since 1960)
+    #   PSUGAISAUSDM   Sugar, ISA Daily Price (monthly since 1960)
+    #   PCOTTINDUSDM   Cotton, A Index (monthly since 1960)
+    #   PRICENPQUSDM   Rice (monthly since 1960)
+    #   PBEABORUSDM    Beef (monthly since 1960)
+    {"name": "AGRICULTURE",
+     "description": "Agricultural Commodities — Wheat, Corn, Soy, Coffee, Sugar, Cotton + Livestock (Daily+Monthly)",
+     "group": "commodities", "unit": "USD/bushel, USD/lb, USD/mt", "frequency": "daily + monthly",
+     "sources": [
+         {"type": "yfinance", "series": {
+             "Wheat_CBOT":       "ZW=F",
+             "Corn_CBOT":        "ZC=F",
+             "Soybeans_CBOT":    "ZS=F",
+             "Coffee_ICE":       "KC=F",
+             "Sugar_ICE":        "SB=F",
+             "Cotton_ICE":       "CT=F",
+             "Cocoa_ICE":        "CC=F",
+             "LiveCattle_CME":   "LE=F",
+             "LeanHogs_CME":     "HE=F",
+             "OrangeJuice_ICE":  "OJ=F",
+         }, "priority": 1,
+          "note": "CBOT/ICE/CME futures — daily since ~1998-2000. "
+                  "10 contracts covering grains, softs, and livestock."},
+         {"type": "fred", "series": {
+             "Global_FoodPrice_Idx": "PFOODINDEXM",
+             "Wheat_USD_mt_Mo":      "PWHEAUSDM",
+             "Corn_USD_mt_Mo":       "PMAIZMTUSDM",
+             "Soybeans_USD_mt_Mo":   "PSOYBUSDM",
+             "Coffee_USD_mt_Mo":     "PCOFFOTMUSDM",
+             "Sugar_USD_mt_Mo":      "PSUGAISAUSDM",
+             "Cotton_USD_mt_Mo":     "PCOTTINDUSDM",
+             "Rice_USD_mt_Mo":       "PRICENPQUSDM",
+             "Beef_USD_mt_Mo":       "PBEABORUSDM",
+         }, "priority": 2,
+          "note": "FAO/World Bank monthly since 1960 (66 years!). "
+                  "Extends history 38 years beyond yfinance futures."},
+     ], "metadata": {"Asset Class": "Agricultural Commodities",
+                     "Region": "Global", "Currency": "USD"}},
+
+
+    # ==================================================================
+    # ==================================================================
+    # ===  PHASE 6 — 4 NEW INDICATORS  ================================
+    # ==================================================================
+    # ==================================================================
+
+    # ==================================================================
+    # 20. GDP_GROWTH — Quarterly Real GDP for 20 Countries
+    # ==================================================================
+    # The most fundamental measure of economic output. Every other macro
+    # indicator (employment, inflation, rates) ultimately serves to
+    # predict or react to GDP growth.
+    #
+    # FRED — Real GDP:
+    #   GDPC1         US Real GDP (quarterly, seasonally adjusted annual rate,
+    #                 since 1947-Q1 — 79 years! The longest GDP series.)
+    #   A191RL1Q225SBEA  US Real GDP growth rate (% change, quarterly since 1947)
+    #   GDPPOT        US Potential GDP (quarterly since 1949 — output gap calc)
+    #   International GDP (quarterly, mostly since ~1960-1980):
+    #     CLVMNACSCAB1GQJP  Japan real GDP
+    #     CLVMNACSCAB1GQDE  Germany real GDP
+    #     CLVMNACSCAB1GQUK  UK real GDP
+    #     CLVMNACSCAB1GQFR  France real GDP
+    #     CLVMNACSCAB1GQIT  Italy real GDP
+    #     CLVMNACSCAB1GQCA  Canada real GDP
+    #     CLVMNACSCAB1GQAU  Australia real GDP
+    #   GDP growth rates (annual, since 1961 — WB):
+    #     NYGDPMKTPKDZ{CC}  Annual GDP growth rate per country
+    #   Nominal GDP for scaling:
+    #     GDP           US Nominal GDP (quarterly since 1947)
+    #
+    # yfinance: broad market ETFs as real-time GDP proxies
+    #   SPY   S&P 500 (equities lead GDP by ~6 months)
+    #   EFA   MSCI EAFE (developed ex-US)
+    #   EEM   MSCI Emerging Markets
+    {"name": "GDP_GROWTH",
+     "description": "Real GDP — US Quarterly (since 1947) + 20 Countries Annual Growth Rates",
+     "group": "macro", "unit": "billions / percent", "frequency": "quarterly + annual",
+     "sources": [
+         {"type": "fred", "series": {
+             # US GDP (quarterly, the gold standard)
+             "US_RealGDP_Billions":    "GDPC1",
+             "US_RealGDP_Growth_Pct":  "A191RL1Q225SBEA",
+             "US_NominalGDP":          "GDP",
+             "US_PotentialGDP":        "GDPPOT",
+             # International real GDP (quarterly, chained local currency)
+             "Japan_RealGDP_Q":        "JPNRGDPEXP",
+             "Germany_RealGDP_Q":      "CLVMNACSCAB1GQDE",
+             "UK_RealGDP_Q":           "CLVMNACSCAB1GQUK",
+             "France_RealGDP_Q":       "CLVMNACSCAB1GQFR",
+             "Italy_RealGDP_Q":        "NAEXKP01ITQ652S",
+             "Canada_RealGDP_Q":       "NAEXKP01CAQ189S",
+             "Australia_RealGDP_Q":    "NAEXKP01AUQ189S",
+             # Annual GDP growth rates (World Bank — wider country coverage)
+             "US_GDP_YoY":             "NYGDPMKTPKDZUSA",
+             "China_GDP_YoY":          "NYGDPMKTPKDZCHN",
+             "India_GDP_YoY":          "NYGDPMKTPKDZIND",
+             "Japan_GDP_YoY":          "NYGDPMKTPKDZJPN",
+             "Germany_GDP_YoY":        "NYGDPMKTPKDZDEU",
+             "UK_GDP_YoY":             "NYGDPMKTPKDZGBR",
+             "France_GDP_YoY":         "NYGDPMKTPKDZFRA",
+             "Brazil_GDP_YoY":         "NYGDPMKTPKDZBRA",
+             "Canada_GDP_YoY":         "NYGDPMKTPKDZCAN",
+             "SKorea_GDP_YoY":         "NYGDPMKTPKDZKOR",
+             "Mexico_GDP_YoY":         "NYGDPMKTPKDZMEX",
+             "Australia_GDP_YoY":      "NYGDPMKTPKDZAUS",
+             "Indonesia_GDP_YoY":      "NYGDPMKTPKDZIDN",
+             "Spain_GDP_YoY":          "NYGDPMKTPKDZESP",
+             "Netherlands_GDP_YoY":    "NYGDPMKTPKDZNLD",
+         }, "priority": 1,
+          "note": "US quarterly GDP since 1947 (79 years). International quarterly since ~1960. "
+                  "Annual growth rates for 15 countries since 1961 (World Bank)."},
+         {"type": "yfinance", "series": {
+             "SPY_US_Equity":       "SPY",
+             "EFA_DevelopedExUS":   "EFA",
+             "EEM_EmergingMkts":    "EEM",
+             "VT_TotalWorld":       "VT",
+         }, "priority": 2,
+          "note": "Broad equity ETFs — lead GDP by ~6 months. "
+                  "S&P500 has predicted 9 of last 11 recessions."},
+     ], "metadata": {"Asset Class": "Macro — Economic Output",
+                     "Region": "US + 15 countries", "Currency": "Local / USD"}},
+
+    # ==================================================================
+    # 21. EQUITY_INDICES — Major Global Stock Market Benchmarks
+    # ==================================================================
+    # Complements the 40-country stock extractor by providing the
+    # BENCHMARK INDICES that each country's stocks are measured against.
+    # Users need both individual stocks AND the index to compute alpha.
+    #
+    # yfinance — major indices (daily, longest histories in finance):
+    #   ^GSPC    S&P 500          (since 1928 — 98 years!)
+    #   ^DJI     Dow Jones 30     (since 1985 on yfinance)
+    #   ^IXIC    NASDAQ Composite (since 1971)
+    #   ^RUT     Russell 2000     (since 1987)
+    #   ^FTSE    FTSE 100         (since 1984)
+    #   ^GDAXI   DAX 40           (since 1990)
+    #   ^FCHI    CAC 40           (since 1990)
+    #   ^STOXX50E Euro Stoxx 50   (since 1987)
+    #   ^N225    Nikkei 225       (since 1965 — 61 years!)
+    #   ^HSI     Hang Seng        (since 1987)
+    #   ^BSESN   BSE Sensex India (since 1997)
+    #   ^KS11    KOSPI Korea      (since 1997)
+    #   ^BVSP    Bovespa Brazil   (since 1993)
+    #   ^AXJO    ASX 200 Aus      (since 1992)
+    #   ^STI     Straits Times SG (since 1987)
+    #   ^TWII    TAIEX Taiwan     (since 1997)
+    #
+    # FRED: S&P 500 level
+    #   SP500    S&P 500 daily close (since 1957)
+    {"name": "EQUITY_INDICES",
+     "description": "Major Global Stock Indices — S&P500, FTSE, DAX, Nikkei, HSI + 12 More (Daily)",
+     "group": "indices", "unit": "index points", "frequency": "daily",
+     "sources": [
+         {"type": "yfinance", "series": {
+             # US
+             "SP500":             "^GSPC",
+             "DowJones30":        "^DJI",
+             "NASDAQ_Composite":  "^IXIC",
+             "Russell2000":       "^RUT",
+             # Europe
+             "FTSE100_UK":        "^FTSE",
+             "DAX40_Germany":     "^GDAXI",
+             "CAC40_France":      "^FCHI",
+             "EuroStoxx50":       "^STOXX50E",
+             "IBEX35_Spain":      "^IBEX",
+             "FTSEMIB_Italy":     "FTSEMIB.MI",
+             # Asia-Pacific
+             "Nikkei225_Japan":   "^N225",
+             "HangSeng_HK":      "^HSI",
+             "Sensex_India":      "^BSESN",
+             "KOSPI_Korea":       "^KS11",
+             "ASX200_Australia":  "^AXJO",
+             "STI_Singapore":     "^STI",
+             "TAIEX_Taiwan":      "^TWII",
+             # Americas (ex-US)
+             "Bovespa_Brazil":    "^BVSP",
+             "SPTSX_Canada":      "^GSPTSE",
+             "IPC_Mexico":        "^MXX",
+         }, "priority": 1,
+          "note": "20 major indices. S&P500 since 1928 (yfinance), Nikkei since 1965. "
+                  "Covers all regions in the 40-country stock extractor."},
+         {"type": "fred", "series": {
+             "SP500_FRED":          "SP500",
+             "WilshireTotal_5000":  "WILL5000IND",
+         }, "priority": 2,
+          "note": "S&P500 daily since 1957 (69 years). Wilshire 5000 since 1971."},
+     ], "metadata": {"Asset Class": "Equity Indices — Global Benchmarks",
+                     "Region": "US + Europe + Asia + Americas (20 countries)"}},
+
+    # ==================================================================
+    # 22. CONSUMER_SENTIMENT — Confidence, PMI, Leading Indicators
+    # ==================================================================
+    # Forward-looking indicators that predict GDP/employment turns.
+    # Sentiment peaks BEFORE recessions, troughs BEFORE recoveries.
+    #
+    # FRED — sentiment & leading indicators:
+    #   UMCSENT      U of Michigan Consumer Sentiment (monthly since 1952 — 74 years!)
+    #   CSCICP03USM665S  OECD Consumer Confidence US (monthly since 1960)
+    #   CSCICP03EZM665S  OECD Consumer Confidence Eurozone
+    #   CSCICP03JPM665S  OECD Consumer Confidence Japan
+    #   CSCICP03GBM665S  OECD Consumer Confidence UK
+    #   CSCICP03DEP665S  OECD Consumer Confidence Germany
+    #   CSCICP03CNM665S  OECD Consumer Confidence China
+    #   MANEMP       ISM Manufacturing Employment (monthly since 1948)
+    #   NAPM         ISM Manufacturing PMI (monthly since 1948 — 78 years!)
+    #   NAPMNOI      ISM New Orders (monthly since 1948)
+    #   USSLIND      US Leading Economic Index, Conference Board (monthly since 1959)
+    #   BSCICP03USM665S  OECD Business Confidence US
+    #   BSCICP03EZM665S  OECD Business Confidence Eurozone
+    #   STLFSI4      St Louis Fed Financial Stress Index (weekly since 1993)
+    #   NFCI         Chicago Fed National Financial Conditions (weekly since 1971)
+    #
+    # yfinance: consumer discretionary vs staples as sentiment proxy
+    {"name": "CONSUMER_SENTIMENT",
+     "description": "Consumer & Business Confidence, PMI, Leading Indicators (Monthly since 1948)",
+     "group": "macro", "unit": "index / diffusion", "frequency": "monthly + weekly",
+     "sources": [
+         {"type": "fred", "series": {
+             # US Consumer Sentiment
+             "UMich_Consumer_Sentiment": "UMCSENT",
+             # OECD Consumer Confidence (normalised around 100)
+             "US_ConsumerConf_OECD":     "CSCICP03USM665S",
+             "EZ_ConsumerConf_OECD":     "CSCICP03EZM665S",
+             "Japan_ConsumerConf_OECD":  "CSCICP03JPM665S",
+             "UK_ConsumerConf_OECD":     "CSCICP03GBM665S",
+             "Germany_ConsumerConf_OECD":"CSCICP03DEP665S",
+             "China_ConsumerConf_OECD":  "CSCICP03CNM665S",
+             # ISM Manufacturing (US)
+             "ISM_Manufacturing_PMI":    "NAPM",
+             "ISM_NewOrders":            "NAPMNOI",
+             "ISM_MfgEmployment":        "MANEMP",
+             # Leading indicators & stress
+             "US_LeadingEcon_Index":     "USSLIND",
+             "US_BusinessConf_OECD":     "BSCICP03USM665S",
+             "EZ_BusinessConf_OECD":     "BSCICP03EZM665S",
+             "StLouis_FinStress":        "STLFSI4",
+             "Chicago_FinConditions":    "NFCI",
+         }, "priority": 1,
+          "note": "U of Michigan since 1952, ISM PMI since 1948 (78 years). "
+                  "OECD confidence for 6 regions. Financial stress weekly since 1971/1993."},
+         {"type": "yfinance", "series": {
+             "XLY_ConsDisc_ETF":    "XLY",
+             "XLP_ConsStaples_ETF": "XLP",
+             "XLI_Industrials_ETF": "XLI",
+         }, "priority": 2,
+          "note": "XLY/XLP ratio = consumer confidence proxy. "
+                  "XLI leads ISM by ~2 months."},
+     ], "metadata": {"Asset Class": "Macro — Sentiment & Leading Indicators",
+                     "Region": "US + Eurozone + Japan + UK + Germany + China"}},
+
+    # ==================================================================
+    # 23. SHIPPING_TRADE — Baltic Dry Index, Trade Balance, Freight
+    # ==================================================================
+    # Physical goods movement = the real-time pulse of global demand.
+    # The Baltic Dry Index is THE leading indicator for global trade.
+    # It cannot be financially speculated (not a futures market) so it
+    # reflects pure supply/demand for bulk shipping capacity.
+    #
+    # FRED — trade data:
+    #   BOPGSTB      US Trade Balance in Goods & Services (monthly since 1992)
+    #   IEABC        US Current Account Balance (quarterly since 1960)
+    #   EXPGS        US Exports G&S (quarterly since 1947)
+    #   IMPGS        US Imports G&S (quarterly since 1947)
+    #   XTEXVA01USM667S  US Total Exports (monthly since 1961, WB)
+    #   XTIMVA01USM667S  US Total Imports (monthly since 1961, WB)
+    #   IR3TIB01USM156N  (already in BONDS — cross-ref)
+    #   International trade:
+    #   XTEXVA01CNM667S  China exports
+    #   XTEXVA01DEP667S  Germany exports
+    #   XTEXVA01JPM667S  Japan exports
+    #   Shipping-adjacent FRED:
+    #   RAILFRMTON       US Rail Freight (weekly carloads, since 2000)
+    #   TSIFRGHT         Transportation Services Index: Freight (since 1979)
+    #
+    # yfinance — shipping / trade ETFs and stocks:
+    #   BDRY     Breakwave Dry Bulk Shipping ETF (tracks Baltic Dry Index!)
+    #            Only ETF that directly tracks BDI. Daily since 2018.
+    #   SBLK     Star Bulk Carriers (dry bulk shipping)
+    #   GOGL     Golden Ocean Group (dry bulk)
+    #   ZIM      ZIM Integrated Shipping (container)
+    #   MATX     Matson Inc (Pacific container shipping)
+    #   DAC      Danaos Corp (container ships)
+    #   FDX      FedEx (global freight bellwether)
+    #   UPS      UPS (parcel/freight bellwether)
+    {"name": "SHIPPING_TRADE",
+     "description": "Global Trade & Shipping — Trade Balance, Exports/Imports, Freight Indices, BDI Proxy",
+     "group": "macro", "unit": "billions USD / index / USD", "frequency": "monthly + daily",
+     "sources": [
+         {"type": "fred", "series": {
+             # US trade balance & flows
+             "US_TradeBalance":        "BOPGSTB",
+             "US_CurrentAccount":      "IEABC",
+             "US_Exports_GS_Q":        "EXPGS",
+             "US_Imports_GS_Q":        "IMPGS",
+             "US_Exports_Mo":          "XTEXVA01USM667S",
+             "US_Imports_Mo":          "XTIMVA01USM667S",
+             # International exports (monthly)
+             "China_Exports_Mo":       "XTEXVA01CNM667S",
+             "Germany_Exports_Mo":     "XTEXVA01DEP667S",
+             "Japan_Exports_Mo":       "XTEXVA01JPM667S",
+             # US freight & transport indices
+             "US_RailFreight_Wk":      "RAILFRMTON",
+             "US_TransportSvc_Freight":"TSIFRGHT",
+         }, "priority": 1,
+          "note": "US trade balance monthly since 1992. Exports/imports since 1947/1961. "
+                  "International exports monthly. Rail freight weekly since 2000."},
+         {"type": "yfinance", "series": {
+             # Baltic Dry Index proxy (BDRY ETF tracks BDI directly)
+             "BDRY_BalticDry_ETF":  "BDRY",
+             # Major dry bulk shipping stocks
+             "SBLK_StarBulk":      "SBLK",
+             "GOGL_GoldenOcean":   "GOGL",
+             # Container shipping
+             "ZIM_Container":      "ZIM",
+             "MATX_Pacific":       "MATX",
+             "DAC_Danaos":         "DAC",
+             # Global freight bellwethers
+             "FDX_FedEx":          "FDX",
+             "UPS_UPS":            "UPS",
+         }, "priority": 2,
+          "note": "BDRY ETF directly tracks Baltic Dry Index (daily since 2018). "
+                  "Shipping stocks since ~1998-2005. FDX/UPS since ~1978."},
+     ], "metadata": {"Asset Class": "Macro — Global Trade & Shipping",
+                     "Region": "Global", "Currency": "USD"}},
+
+]
+# ===========================================================================
+
+
+# ===========================================================================
+# GROUPS
+# ===========================================================================
+
+GROUPS = {
+    "commodities":  ["GOLD", "OIL", "SILVER", "METALS", "RARE_EARTHS",
+                     "SEMICONDUCTORS", "AGRICULTURE"],
+    "rates":        ["BONDS", "INTEREST_RATES", "CREDIT_SPREADS", "FOREX"],
+    "volatility":   ["VIX"],
+    "indices":      ["EQUITY_INDICES"],
+    "macro":        ["GOV_DEBT_LEVEL", "WORLD_LEVERAGE", "DEMOGRAPHICS",
+                     "HOUSEHOLD_ALLOCATION", "INFLATION", "REAL_ESTATE",
+                     "EMPLOYMENT", "GDP_GROWTH", "CONSUMER_SENTIMENT",
+                     "SHIPPING_TRADE"],
+    "phase1":       ["GOLD", "BONDS", "VIX", "OIL"],
+    "phase2":       ["SILVER", "METALS", "INTEREST_RATES"],
+    "phase3":       ["CREDIT_SPREADS", "GOV_DEBT_LEVEL", "WORLD_LEVERAGE", "RARE_EARTHS"],
+    "phase4":       ["SEMICONDUCTORS", "DEMOGRAPHICS", "HOUSEHOLD_ALLOCATION", "FOREX"],
+    "phase5":       ["INFLATION", "REAL_ESTATE", "EMPLOYMENT", "AGRICULTURE"],
+    "phase6":       ["GDP_GROWTH", "EQUITY_INDICES", "CONSUMER_SENTIMENT", "SHIPPING_TRADE"],
+    "all":          ["GOLD", "BONDS", "VIX", "OIL", "SILVER", "METALS",
+                     "INTEREST_RATES", "CREDIT_SPREADS", "GOV_DEBT_LEVEL",
+                     "WORLD_LEVERAGE", "RARE_EARTHS", "SEMICONDUCTORS",
+                     "DEMOGRAPHICS", "HOUSEHOLD_ALLOCATION", "FOREX",
+                     "INFLATION", "REAL_ESTATE", "EMPLOYMENT", "AGRICULTURE",
+                     "GDP_GROWTH", "EQUITY_INDICES", "CONSUMER_SENTIMENT",
+                     "SHIPPING_TRADE"],
+}
+
+
+# ===========================================================================
+# ENGINE (unchanged)
+# ===========================================================================
+
+def extract_indicator(job):
+    name = job["name"]
+    log.info(f"\n{'='*60}\nEXTRACTING: {name}\n  {job['description']}"
+             f"\n  Period: {START_DATE} -> {END_DATE}\n{'='*60}")
+    all_frames = []
+    for src in sorted(job["sources"], key=lambda s: s.get("priority", 99)):
+        st, series, note = src["type"], src["series"], src.get("note", "")
+        log.info(f"\n  Source: {st} (priority {src.get('priority','?')})")
+        if note: log.info(f"    {note}")
+        df = pd.DataFrame()
+        if st == "fred":
+            if not FRED_API_KEY:
+                log.warning("    Skipping FRED — no API key. Set FRED_API_KEY env var.")
+                continue
+            df = fetch_fred_multiple(series, START_DATE, END_DATE)
+        elif st == "yfinance":
+            df = fetch_yfinance_series(series, START_DATE, END_DATE)
+        if not df.empty:
+            all_frames.append(df)
+            log.info(f"    Got {df.shape[1]} series x {len(df)} days")
+        else:
+            log.warning(f"    No data from {st}")
+    if not all_frames:
+        log.error(f"  No data for {name}. Skipping.")
+        return pd.DataFrame()
+    combined = all_frames[0]
+    for df in all_frames[1:]:
+        new = [c for c in df.columns if c not in combined.columns]
+        if new: combined = combined.join(df[new], how="outer")
+    combined = combined.sort_index()
+    td, ts = len(combined), combined.shape[1]
+    pct = (combined.notna().sum().sum()/(td*ts)*100) if td > 0 else 0
+    log.info(f"\n  COMBINED: {ts} series x {td} days")
+    log.info(f"  Range: {combined.index.min().date()} -> {combined.index.max().date()}")
+    log.info(f"  Completeness: {pct:.1f}%")
+    for col in combined.columns:
+        s = combined[col].dropna()
+        if len(s) > 0:
+            try: v = f"{float(s.iloc[-1]):.4f}"
+            except: v = str(s.iloc[-1])
+            log.info(f"    {col}: {len(s)} obs, "
+                     f"{s.index.min().date()} -> {s.index.max().date()}, latest={v}")
+    return combined
+
+def save_indicator(job, df):
+    if df.empty: return
+    name, metadata = job["name"], job.get("metadata", {})
+    df_wide = df.transpose()
+    df_wide.columns = pd.to_datetime(df_wide.columns).strftime("%Y-%m-%d")
+    mc = pd.DataFrame(index=df_wide.index)
+    mc["Description"] = job["description"]
+    mc["Unit"] = job.get("unit", "")
+    mc["Frequency"] = job.get("frequency", "daily")
+    for k, v in metadata.items(): mc[k] = v
+    out = pd.concat([mc, df_wide], axis=1)
+    fn = os.path.join(OUTPUT_DIR, f"{name}_{df.shape[1]}_series_{len(df)}_days.csv")
+    out.to_csv(fn, index_label="Series")
+    log.info(f"\n  SAVED: {fn}\n    {df.shape[1]} series x {len(df)} days + {len(mc.columns)} meta cols")
+    save_indicator_cache(name, {"last_fetched": datetime.today().strftime("%Y-%m-%d %H:%M:%S"),
+        "series_count": df.shape[1], "day_count": len(df), "file_path": fn,
+        "date_range": f"{df.index.min().date()} -> {df.index.max().date()}"})
+
+def print_summary(results):
+    log.info(f"\n{'='*75}\nEXTRACTION SUMMARY\n{'='*75}")
+    log.info(f"{'Indicator':<25} {'Series':>8} {'Days':>8} {'Date Range':<30} {'Status'}")
+    log.info(f"{'-'*25} {'-'*8} {'-'*8} {'-'*30} {'-'*10}")
+    for r in results:
+        log.info(f"{r['name']:<25} {r['series']:>8} {r['days']:>8} "
+                 f"{r['date_range']:<30} {'OK' if r['success'] else 'FAIL'}")
+    log.info(f"\n  Total: {sum(1 for r in results if r['success'])}/{len(results)} OK")
+
+def run_all(jobs):
+    results = []
+    for i, job in enumerate(jobs, 1):
+        log.info(f"\n[{i}/{len(jobs)}] Starting {job['name']}...")
+        df = extract_indicator(job)
+        if not df.empty:
+            save_indicator(job, df)
+            results.append({"name": job["name"], "success": True, "series": df.shape[1],
+                            "days": len(df),
+                            "date_range": f"{df.index.min().date()} -> {df.index.max().date()}"})
+        else:
+            results.append({"name": job["name"], "success": False, "series": 0, "days": 0,
+                            "date_range": "N/A"})
+        if i < len(jobs): time.sleep(INTER_INDICATOR_DELAY)
+    print_summary(results)
+
+def run_group(g):
+    g = g.lower()
+    if g not in GROUPS:
+        log.error(f"Unknown group '{g}'. Available: {list(GROUPS.keys())}"); return
+    jobs = [j for j in INDICATOR_JOBS if j["name"] in GROUPS[g]]
+    log.info(f"Group '{g}': {len(jobs)} indicators -> {GROUPS[g]}")
+    run_all(jobs)
+
+def run_single(name):
+    m = [j for j in INDICATOR_JOBS if j["name"].lower() == name.lower()]
+    if not m:
+        log.error(f"'{name}' not found. Available: {[j['name'] for j in INDICATOR_JOBS]}"); return
+    df = extract_indicator(m[0])
+    if not df.empty: save_indicator(m[0], df)
+
+def list_indicators():
+    print(f"\n{'='*75}\nAVAILABLE INDICATORS v6 — {len(INDICATOR_JOBS)} active\n{'='*75}\n")
+    for j in INDICATOR_JOBS:
+        src = " + ".join(s["type"] for s in j["sources"])
+        ns = sum(len(s["series"]) for s in j["sources"])
+        print(f"  {j['name']:<25} {j.get('group',''):<15} [{src}] ({ns} series)")
+        print(f"    {j['description']}")
+    print(f"\nGroups (--group):")
+    for g, ns in GROUPS.items(): print(f"  {g:<15} -> {ns}")
+    print(f"\nFRED: {'SET' if FRED_API_KEY else 'NOT SET'} "
+          f"(free: https://fred.stlouisfed.org/docs/api/api_key.html)\n")
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Global Indicator Data Extractor v6 — 23 Indicators",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="Examples:\n"
+               "  python extract_indicator_data.py                          # all 23\n"
+               "  python extract_indicator_data.py --group phase6           # 4 newest\n"
+               "  python extract_indicator_data.py --indicator GDP_GROWTH\n"
+               "  python extract_indicator_data.py --indicator EQUITY_INDICES\n"
+               "  python extract_indicator_data.py --indicator CONSUMER_SENTIMENT\n"
+               "  python extract_indicator_data.py --indicator SHIPPING_TRADE\n"
+               "  python extract_indicator_data.py --group commodities      # 7 indicators\n"
+               "  python extract_indicator_data.py --group macro            # 10 indicators\n"
+               "  python extract_indicator_data.py --group indices          # equity benchmarks\n"
+               "  python extract_indicator_data.py --list\n")
+    p.add_argument("--indicator", type=str)
+    p.add_argument("--group", type=str)
+    p.add_argument("--list", action="store_true")
+    args = p.parse_args()
+    if args.list: list_indicators()
+    elif args.indicator: run_single(args.indicator)
+    elif args.group: run_group(args.group)
+    else: run_all(INDICATOR_JOBS)
