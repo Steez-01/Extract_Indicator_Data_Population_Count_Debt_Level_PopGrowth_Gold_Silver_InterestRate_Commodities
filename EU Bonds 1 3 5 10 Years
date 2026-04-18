@@ -24,7 +24,7 @@ Global Indicator Data Extractor v6 — 23 Active Indicators, 50-Year Daily
   17 REAL_ESTATE           macro         Housing prices, starts, REITs
   18 EMPLOYMENT            macro         Jobless claims, unemployment
   19 AGRICULTURE           commodities   Wheat, corn, soy, coffee etc
-  20 GDP_GROWTH            macro         Quarterly GDP 20 countries       (v6 NEW)
+  20 GDP_GROWTH            macro         Top 30 GDP: growth + nominal   (v6 NEW, expanded)
   21 EQUITY_INDICES        indices       S&P500, FTSE, DAX, Nikkei etc    (v6 NEW)
   22 CONSUMER_SENTIMENT    macro         Confidence, PMI, LEI             (v6 NEW)
   23 SHIPPING_TRADE        macro         Baltic Dry, trade balance        (v6 NEW)
@@ -61,7 +61,8 @@ FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 def ensure_dependencies():
     missing = []
-    for imp, pip in {"yfinance":"yfinance","pandas":"pandas","fredapi":"fredapi"}.items():
+    for imp, pip in {"yfinance":"yfinance","pandas":"pandas","fredapi":"fredapi",
+                     "openpyxl":"openpyxl"}.items():
         try: __import__(imp)
         except ImportError: missing.append(pip)
     if missing:
@@ -131,6 +132,105 @@ def fetch_yfinance_series(tickers, start=START_DATE, end=END_DATE):
             else:
                 log.warning(f"   yfinance attempt {attempt}: {e}")
                 if attempt < RETRY_ATTEMPTS: time.sleep(RETRY_DELAY*attempt)
+    return pd.DataFrame()
+
+# --- World Bank API adapter (NO API KEY NEEDED) ---------------------------
+# Uses the free World Bank Open Data API: https://api.worldbank.org/v2/
+# BATCH mode: fetches ALL countries for one indicator in a single HTTP call.
+# 3 indicators × 1 call each = 3 total calls instead of 90.
+#
+# Series dict format: {"Display_Name": "ISO3/WB_INDICATOR_CODE"}
+#   e.g. {"US_GDP_Growth": "USA/NY.GDP.MKTP.KD.ZG"}
+import urllib.request, urllib.error
+
+def fetch_worldbank_series(series_dict, start=START_DATE, end=END_DATE):
+    """Fetch World Bank indicators using BATCH API calls. No API key needed.
+
+    Groups all series by indicator code, then fetches each indicator for
+    all countries in ONE call. 30 countries × 3 indicators = 3 HTTP calls.
+    """
+    start_year = int(start[:4])
+    end_year   = int(end[:4])
+
+    # Group series by indicator code: {indicator: [(display_name, iso3), ...]}
+    indicator_groups = {}
+    for display_name, spec in series_dict.items():
+        parts = spec.split("/", 1)
+        if len(parts) != 2:
+            continue
+        iso3, indicator = parts
+        if indicator not in indicator_groups:
+            indicator_groups[indicator] = []
+        indicator_groups[indicator].append((display_name, iso3))
+
+    frames = []
+
+    for indicator, country_list in indicator_groups.items():
+        # Build batch country string: "USA;CHN;DEU;JPN;..."
+        iso3_codes = [iso3 for _, iso3 in country_list]
+        countries_str = ";".join(iso3_codes)
+
+        # Name lookup: iso3 → display_name
+        name_lookup = {iso3: dname for dname, iso3 in country_list}
+
+        url = (f"https://api.worldbank.org/v2/country/{countries_str}"
+               f"/indicator/{indicator}"
+               f"?format=json&per_page=10000&date={start_year}:{end_year}")
+
+        log.info(f"   WB batch: {indicator} for {len(iso3_codes)} countries...")
+
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    raw = json.loads(resp.read())
+
+                if not raw or len(raw) < 2 or not raw[1]:
+                    log.warning(f"   WB: no data returned for {indicator}")
+                    break
+
+                # Parse response — group by country
+                country_data = {}  # iso3 → {year: value}
+                for rec in raw[1]:
+                    iso3 = rec.get("countryiso3code") or rec.get("country", {}).get("id", "")
+                    year = rec.get("date")
+                    val  = rec.get("value")
+                    if iso3 and year and val is not None:
+                        try:
+                            if iso3 not in country_data:
+                                country_data[iso3] = {}
+                            country_data[iso3][f"{year}-01-01"] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+
+                # Build a Series for each country that was requested
+                for iso3, dname in name_lookup.items():
+                    if iso3 in country_data and country_data[iso3]:
+                        s = pd.Series(country_data[iso3], name=dname)
+                        s.index = pd.to_datetime(s.index)
+                        s = s.sort_index()
+                        frames.append(s)
+
+                n_got = sum(1 for iso3 in name_lookup if iso3 in country_data and country_data[iso3])
+                log.info(f"   WB {indicator}: {n_got}/{len(iso3_codes)} countries, "
+                         f"~{len(raw[1])} records")
+                break  # success — exit retry loop
+
+            except urllib.error.HTTPError as e:
+                log.warning(f"   WB HTTP {e.code} for {indicator} (attempt {attempt}): {e.reason}")
+                if attempt < RETRY_ATTEMPTS:
+                    time.sleep(5 * attempt)
+            except Exception as e:
+                log.warning(f"   WB {indicator} attempt {attempt}: {e}")
+                if attempt < RETRY_ATTEMPTS:
+                    time.sleep(5 * attempt)
+
+        time.sleep(1)  # pause between indicator batches
+
+    if frames:
+        df = pd.concat(frames, axis=1)
+        df.index = pd.to_datetime(df.index)
+        return df.sort_index()
     return pd.DataFrame()
 
 
@@ -952,81 +1052,157 @@ INDICATOR_JOBS = [
     # ==================================================================
 
     # ==================================================================
-    # 20. GDP_GROWTH — Quarterly Real GDP for 20 Countries
+    # 20. GDP_GROWTH — Top 30 GDP Countries, 40+ Years Annual + Quarterly
     # ==================================================================
-    # The most fundamental measure of economic output. Every other macro
-    # indicator (employment, inflation, rates) ultimately serves to
-    # predict or react to GDP growth.
+    # Three World Bank indicators per country (NO API KEY NEEDED):
+    #   NY.GDP.MKTP.KD.ZG — GDP growth rate (% YoY annual, since 1961)
+    #   NY.GDP.MKTP.CD    — Nominal GDP (current USD, since 1960)
+    #   NY.GDP.PCAP.CD    — GDP per capita (current USD, since 1960)
     #
-    # FRED — Real GDP:
-    #   GDPC1         US Real GDP (quarterly, seasonally adjusted annual rate,
-    #                 since 1947-Q1 — 79 years! The longest GDP series.)
-    #   A191RL1Q225SBEA  US Real GDP growth rate (% change, quarterly since 1947)
-    #   GDPPOT        US Potential GDP (quarterly since 1949 — output gap calc)
-    #   International GDP (quarterly, mostly since ~1960-1980):
-    #     CLVMNACSCAB1GQJP  Japan real GDP
-    #     CLVMNACSCAB1GQDE  Germany real GDP
-    #     CLVMNACSCAB1GQUK  UK real GDP
-    #     CLVMNACSCAB1GQFR  France real GDP
-    #     CLVMNACSCAB1GQIT  Italy real GDP
-    #     CLVMNACSCAB1GQCA  Canada real GDP
-    #     CLVMNACSCAB1GQAU  Australia real GDP
-    #   GDP growth rates (annual, since 1961 — WB):
-    #     NYGDPMKTPKDZ{CC}  Annual GDP growth rate per country
-    #   Nominal GDP for scaling:
-    #     GDP           US Nominal GDP (quarterly since 1947)
+    # Source priority:
+    #   1. World Bank API (free, no key) → 90 annual series for 30 countries
+    #   2. FRED (free key needed) → US quarterly + G7 quarterly detail
+    #   3. yfinance → equity ETF proxies
     #
-    # yfinance: broad market ETFs as real-time GDP proxies
-    #   SPY   S&P 500 (equities lead GDP by ~6 months)
-    #   EFA   MSCI EAFE (developed ex-US)
-    #   EEM   MSCI Emerging Markets
+    # Top 30 by 2025 nominal GDP (user-provided):
+    #   1 USA  2 China  3 Germany  4 Japan  5 UK  6 India  7 France
+    #   8 Italy  9 Russia  10 Brazil  11 Canada  12 Australia  13 Mexico
+    #   14 Spain  15 S.Korea  16 Turkey  17 Indonesia  18 Netherlands
+    #   19 Saudi Arabia  20 Switzerland  21 Poland  22 Taiwan  23 Ireland
+    #   24 Belgium  25 Sweden  26 Israel  27 Argentina  28 Singapore
+    #   29 Austria  30 UAE
     {"name": "GDP_GROWTH",
-     "description": "Real GDP — US Quarterly (since 1947) + 20 Countries Annual Growth Rates",
-     "group": "macro", "unit": "billions / percent", "frequency": "quarterly + annual",
+     "description": "GDP Top 30 — Growth Rate + Nominal GDP + GDP per Capita (Annual since 1960) + US/G7 Quarterly",
+     "group": "macro", "unit": "percent / billions USD / USD per capita", "frequency": "annual + quarterly",
      "sources": [
-         {"type": "fred", "series": {
-             # US GDP (quarterly, the gold standard)
-             "US_RealGDP_Billions":    "GDPC1",
-             "US_RealGDP_Growth_Pct":  "A191RL1Q225SBEA",
-             "US_NominalGDP":          "GDP",
-             "US_PotentialGDP":        "GDPPOT",
-             # International real GDP (quarterly, chained local currency)
-             "Japan_RealGDP_Q":        "JPNRGDPEXP",
-             "Germany_RealGDP_Q":      "CLVMNACSCAB1GQDE",
-             "UK_RealGDP_Q":           "CLVMNACSCAB1GQUK",
-             "France_RealGDP_Q":       "CLVMNACSCAB1GQFR",
-             "Italy_RealGDP_Q":        "NAEXKP01ITQ652S",
-             "Canada_RealGDP_Q":       "NAEXKP01CAQ189S",
-             "Australia_RealGDP_Q":    "NAEXKP01AUQ189S",
-             # Annual GDP growth rates (World Bank — wider country coverage)
-             "US_GDP_YoY":             "NYGDPMKTPKDZUSA",
-             "China_GDP_YoY":          "NYGDPMKTPKDZCHN",
-             "India_GDP_YoY":          "NYGDPMKTPKDZIND",
-             "Japan_GDP_YoY":          "NYGDPMKTPKDZJPN",
-             "Germany_GDP_YoY":        "NYGDPMKTPKDZDEU",
-             "UK_GDP_YoY":             "NYGDPMKTPKDZGBR",
-             "France_GDP_YoY":         "NYGDPMKTPKDZFRA",
-             "Brazil_GDP_YoY":         "NYGDPMKTPKDZBRA",
-             "Canada_GDP_YoY":         "NYGDPMKTPKDZCAN",
-             "SKorea_GDP_YoY":         "NYGDPMKTPKDZKOR",
-             "Mexico_GDP_YoY":         "NYGDPMKTPKDZMEX",
-             "Australia_GDP_YoY":      "NYGDPMKTPKDZAUS",
-             "Indonesia_GDP_YoY":      "NYGDPMKTPKDZIDN",
-             "Spain_GDP_YoY":          "NYGDPMKTPKDZESP",
-             "Netherlands_GDP_YoY":    "NYGDPMKTPKDZNLD",
+         # ── PRIORITY 1: World Bank API (NO API KEY NEEDED) ──────────────
+         # This is why it works without any registration. The World Bank
+         # Open Data API is completely free and keyless.
+         # Format: "DisplayName": "ISO3/WB_INDICATOR_CODE"
+         {"type": "worldbank", "series": {
+             # ── GDP GROWTH RATE (% YoY) ──────────────────────────────────
+             "US_GDP_Growth":              "USA/NY.GDP.MKTP.KD.ZG",
+             "China_GDP_Growth":           "CHN/NY.GDP.MKTP.KD.ZG",
+             "Germany_GDP_Growth":         "DEU/NY.GDP.MKTP.KD.ZG",
+             "Japan_GDP_Growth":           "JPN/NY.GDP.MKTP.KD.ZG",
+             "UK_GDP_Growth":              "GBR/NY.GDP.MKTP.KD.ZG",
+             "India_GDP_Growth":           "IND/NY.GDP.MKTP.KD.ZG",
+             "France_GDP_Growth":          "FRA/NY.GDP.MKTP.KD.ZG",
+             "Italy_GDP_Growth":           "ITA/NY.GDP.MKTP.KD.ZG",
+             "Russia_GDP_Growth":          "RUS/NY.GDP.MKTP.KD.ZG",
+             "Brazil_GDP_Growth":          "BRA/NY.GDP.MKTP.KD.ZG",
+             "Canada_GDP_Growth":          "CAN/NY.GDP.MKTP.KD.ZG",
+             "Australia_GDP_Growth":       "AUS/NY.GDP.MKTP.KD.ZG",
+             "Mexico_GDP_Growth":          "MEX/NY.GDP.MKTP.KD.ZG",
+             "Spain_GDP_Growth":           "ESP/NY.GDP.MKTP.KD.ZG",
+             "SouthKorea_GDP_Growth":      "KOR/NY.GDP.MKTP.KD.ZG",
+             "Turkey_GDP_Growth":          "TUR/NY.GDP.MKTP.KD.ZG",
+             "Indonesia_GDP_Growth":       "IDN/NY.GDP.MKTP.KD.ZG",
+             "Netherlands_GDP_Growth":     "NLD/NY.GDP.MKTP.KD.ZG",
+             "SaudiArabia_GDP_Growth":     "SAU/NY.GDP.MKTP.KD.ZG",
+             "Switzerland_GDP_Growth":     "CHE/NY.GDP.MKTP.KD.ZG",
+             "Poland_GDP_Growth":          "POL/NY.GDP.MKTP.KD.ZG",
+             "Taiwan_GDP_Growth":          "TWN/NY.GDP.MKTP.KD.ZG",
+             "Ireland_GDP_Growth":         "IRL/NY.GDP.MKTP.KD.ZG",
+             "Belgium_GDP_Growth":         "BEL/NY.GDP.MKTP.KD.ZG",
+             "Sweden_GDP_Growth":          "SWE/NY.GDP.MKTP.KD.ZG",
+             "Israel_GDP_Growth":          "ISR/NY.GDP.MKTP.KD.ZG",
+             "Argentina_GDP_Growth":       "ARG/NY.GDP.MKTP.KD.ZG",
+             "Singapore_GDP_Growth":       "SGP/NY.GDP.MKTP.KD.ZG",
+             "Austria_GDP_Growth":         "AUT/NY.GDP.MKTP.KD.ZG",
+             "UAE_GDP_Growth":             "ARE/NY.GDP.MKTP.KD.ZG",
+             # ── NOMINAL GDP (current USD) ────────────────────────────────
+             "US_GDP_Nominal_USD":         "USA/NY.GDP.MKTP.CD",
+             "China_GDP_Nominal_USD":      "CHN/NY.GDP.MKTP.CD",
+             "Germany_GDP_Nominal_USD":    "DEU/NY.GDP.MKTP.CD",
+             "Japan_GDP_Nominal_USD":      "JPN/NY.GDP.MKTP.CD",
+             "UK_GDP_Nominal_USD":         "GBR/NY.GDP.MKTP.CD",
+             "India_GDP_Nominal_USD":      "IND/NY.GDP.MKTP.CD",
+             "France_GDP_Nominal_USD":     "FRA/NY.GDP.MKTP.CD",
+             "Italy_GDP_Nominal_USD":      "ITA/NY.GDP.MKTP.CD",
+             "Russia_GDP_Nominal_USD":     "RUS/NY.GDP.MKTP.CD",
+             "Brazil_GDP_Nominal_USD":     "BRA/NY.GDP.MKTP.CD",
+             "Canada_GDP_Nominal_USD":     "CAN/NY.GDP.MKTP.CD",
+             "Australia_GDP_Nominal_USD":  "AUS/NY.GDP.MKTP.CD",
+             "Mexico_GDP_Nominal_USD":     "MEX/NY.GDP.MKTP.CD",
+             "Spain_GDP_Nominal_USD":      "ESP/NY.GDP.MKTP.CD",
+             "SouthKorea_GDP_Nominal_USD": "KOR/NY.GDP.MKTP.CD",
+             "Turkey_GDP_Nominal_USD":     "TUR/NY.GDP.MKTP.CD",
+             "Indonesia_GDP_Nominal_USD":  "IDN/NY.GDP.MKTP.CD",
+             "Netherlands_GDP_Nominal_USD":"NLD/NY.GDP.MKTP.CD",
+             "SaudiArabia_GDP_Nominal_USD":"SAU/NY.GDP.MKTP.CD",
+             "Switzerland_GDP_Nominal_USD":"CHE/NY.GDP.MKTP.CD",
+             "Poland_GDP_Nominal_USD":     "POL/NY.GDP.MKTP.CD",
+             "Taiwan_GDP_Nominal_USD":     "TWN/NY.GDP.MKTP.CD",
+             "Ireland_GDP_Nominal_USD":    "IRL/NY.GDP.MKTP.CD",
+             "Belgium_GDP_Nominal_USD":    "BEL/NY.GDP.MKTP.CD",
+             "Sweden_GDP_Nominal_USD":     "SWE/NY.GDP.MKTP.CD",
+             "Israel_GDP_Nominal_USD":     "ISR/NY.GDP.MKTP.CD",
+             "Argentina_GDP_Nominal_USD":  "ARG/NY.GDP.MKTP.CD",
+             "Singapore_GDP_Nominal_USD":  "SGP/NY.GDP.MKTP.CD",
+             "Austria_GDP_Nominal_USD":    "AUT/NY.GDP.MKTP.CD",
+             "UAE_GDP_Nominal_USD":        "ARE/NY.GDP.MKTP.CD",
+             # ── GDP PER CAPITA (current USD) ─────────────────────────────
+             "US_GDP_PerCapita":           "USA/NY.GDP.PCAP.CD",
+             "China_GDP_PerCapita":        "CHN/NY.GDP.PCAP.CD",
+             "Germany_GDP_PerCapita":      "DEU/NY.GDP.PCAP.CD",
+             "Japan_GDP_PerCapita":        "JPN/NY.GDP.PCAP.CD",
+             "UK_GDP_PerCapita":           "GBR/NY.GDP.PCAP.CD",
+             "India_GDP_PerCapita":        "IND/NY.GDP.PCAP.CD",
+             "France_GDP_PerCapita":       "FRA/NY.GDP.PCAP.CD",
+             "Italy_GDP_PerCapita":        "ITA/NY.GDP.PCAP.CD",
+             "Russia_GDP_PerCapita":       "RUS/NY.GDP.PCAP.CD",
+             "Brazil_GDP_PerCapita":       "BRA/NY.GDP.PCAP.CD",
+             "Canada_GDP_PerCapita":       "CAN/NY.GDP.PCAP.CD",
+             "Australia_GDP_PerCapita":    "AUS/NY.GDP.PCAP.CD",
+             "Mexico_GDP_PerCapita":       "MEX/NY.GDP.PCAP.CD",
+             "Spain_GDP_PerCapita":        "ESP/NY.GDP.PCAP.CD",
+             "SouthKorea_GDP_PerCapita":   "KOR/NY.GDP.PCAP.CD",
+             "Turkey_GDP_PerCapita":       "TUR/NY.GDP.PCAP.CD",
+             "Indonesia_GDP_PerCapita":    "IDN/NY.GDP.PCAP.CD",
+             "Netherlands_GDP_PerCapita":  "NLD/NY.GDP.PCAP.CD",
+             "SaudiArabia_GDP_PerCapita":  "SAU/NY.GDP.PCAP.CD",
+             "Switzerland_GDP_PerCapita":  "CHE/NY.GDP.PCAP.CD",
+             "Poland_GDP_PerCapita":       "POL/NY.GDP.PCAP.CD",
+             "Taiwan_GDP_PerCapita":       "TWN/NY.GDP.PCAP.CD",
+             "Ireland_GDP_PerCapita":      "IRL/NY.GDP.PCAP.CD",
+             "Belgium_GDP_PerCapita":      "BEL/NY.GDP.PCAP.CD",
+             "Sweden_GDP_PerCapita":       "SWE/NY.GDP.PCAP.CD",
+             "Israel_GDP_PerCapita":       "ISR/NY.GDP.PCAP.CD",
+             "Argentina_GDP_PerCapita":    "ARG/NY.GDP.PCAP.CD",
+             "Singapore_GDP_PerCapita":    "SGP/NY.GDP.PCAP.CD",
+             "Austria_GDP_PerCapita":      "AUT/NY.GDP.PCAP.CD",
+             "UAE_GDP_PerCapita":          "ARE/NY.GDP.PCAP.CD",
          }, "priority": 1,
-          "note": "US quarterly GDP since 1947 (79 years). International quarterly since ~1960. "
-                  "Annual growth rates for 15 countries since 1961 (World Bank)."},
+          "note": "World Bank Open Data API — NO API KEY NEEDED. "
+                  "30 countries x 3 metrics (growth %, nominal USD, per-capita USD). "
+                  "Annual since 1960. Taiwan may have gaps (WB political exclusion)."},
+         # ── PRIORITY 2: FRED (needs free API key) → quarterly detail ────
+         {"type": "fred", "series": {
+             "US_RealGDP_Quarterly":       "GDPC1",
+             "US_RealGDP_Growth_QoQ":      "A191RL1Q225SBEA",
+             "US_NominalGDP_Quarterly":    "GDP",
+             "US_PotentialGDP":            "GDPPOT",
+             "Japan_RealGDP_Q":            "JPNRGDPEXP",
+             "Germany_RealGDP_Q":          "CLVMNACSCAB1GQDE",
+             "UK_RealGDP_Q":              "CLVMNACSCAB1GQUK",
+             "France_RealGDP_Q":          "CLVMNACSCAB1GQFR",
+             "Italy_RealGDP_Q":           "NAEXKP01ITQ652S",
+             "Canada_RealGDP_Q":          "NAEXKP01CAQ189S",
+             "Australia_RealGDP_Q":       "NAEXKP01AUQ189S",
+         }, "priority": 2,
+          "note": "US quarterly since 1947 + G7 quarterly. Needs FRED API key."},
+         # ── PRIORITY 3: yfinance → equity ETF proxies ───────────────────
          {"type": "yfinance", "series": {
              "SPY_US_Equity":       "SPY",
              "EFA_DevelopedExUS":   "EFA",
              "EEM_EmergingMkts":    "EEM",
              "VT_TotalWorld":       "VT",
-         }, "priority": 2,
-          "note": "Broad equity ETFs — lead GDP by ~6 months. "
-                  "S&P500 has predicted 9 of last 11 recessions."},
+         }, "priority": 3,
+          "note": "Broad equity ETFs — lead GDP by ~6 months."},
      ], "metadata": {"Asset Class": "Macro — Economic Output",
-                     "Region": "US + 15 countries", "Currency": "Local / USD"}},
+                     "Region": "Top 30 GDP countries (2025 ranking)",
+                     "Currency": "USD (nominal+per capita) / Local (quarterly real)"}},
 
     # ==================================================================
     # 21. EQUITY_INDICES — Major Global Stock Market Benchmarks
@@ -1266,6 +1442,212 @@ GROUPS = {
 
 
 # ===========================================================================
+# EXCEL TAB NAMES — short, readable names for the merged workbook
+# ===========================================================================
+# Excel tab names max 31 characters. These are the overarching topic labels.
+
+TAB_NAMES = {
+    "GOLD":                  "Gold",
+    "BONDS":                 "Sovereign Bonds",
+    "VIX":                   "Volatility VIX",
+    "OIL":                   "Oil & Energy",
+    "SILVER":                "Silver",
+    "METALS":                "Base Metals",
+    "INTEREST_RATES":        "Policy Rates",
+    "CREDIT_SPREADS":        "Credit Spreads",
+    "GOV_DEBT_LEVEL":        "Govt Debt-to-GDP",
+    "WORLD_LEVERAGE":        "Leverage & Money",
+    "RARE_EARTHS":           "Rare Earths",
+    "SEMICONDUCTORS":        "Semiconductors",
+    "DEMOGRAPHICS":          "Population & Migration",
+    "HOUSEHOLD_ALLOCATION":  "HH Allocation",
+    "FOREX":                 "Currencies FX",
+    "INFLATION":             "Inflation CPI PPI",
+    "REAL_ESTATE":           "Real Estate",
+    "EMPLOYMENT":            "Employment & Labor",
+    "AGRICULTURE":           "Agriculture",
+    "GDP_GROWTH":            "GDP Top 30 Countries",
+    "EQUITY_INDICES":        "Equity Indices",
+    "CONSUMER_SENTIMENT":    "Sentiment & PMI",
+    "SHIPPING_TRADE":        "Trade & Shipping",
+}
+
+
+# ===========================================================================
+# MERGED EXCEL WORKBOOK — all indicators as tabs in one .xlsx
+# ===========================================================================
+
+def merge_to_excel(job_names: list = None):
+    """Read all indicator CSVs from OUTPUT_DIR and write them as tabs in one Excel.
+
+    Each tab = one indicator's CSV, named with the human-readable TAB_NAMES.
+    Also adds a 'Summary' tab as the first sheet with an overview of all indicators.
+
+    Args:
+        job_names: list of indicator names that were just extracted.
+                   If None, scans OUTPUT_DIR for all matching CSVs.
+    """
+    import glob
+
+    # Find all indicator CSVs in output/
+    csv_pattern = os.path.join(OUTPUT_DIR, "*_series_*_days.csv")
+    all_csvs = sorted(glob.glob(csv_pattern))
+
+    if not all_csvs:
+        log.warning("  No indicator CSVs found in output/ — skipping Excel merge.")
+        return None
+
+    # If job_names provided, filter to only those (keeps order)
+    if job_names:
+        name_set = set(job_names)
+        filtered = []
+        for csv_path in all_csvs:
+            basename = os.path.basename(csv_path)
+            # Extract indicator name from filename: NAME_N_series_N_days.csv
+            indicator_name = basename.split("_")[0]
+            # Handle multi-word names like CREDIT_SPREADS, RARE_EARTHS etc.
+            for name in name_set:
+                if basename.startswith(name + "_"):
+                    filtered.append((name, csv_path))
+                    break
+        csv_files = filtered
+    else:
+        # Auto-detect from all CSVs
+        csv_files = []
+        for csv_path in all_csvs:
+            basename = os.path.basename(csv_path)
+            # Try to match against known indicator names
+            matched = False
+            for name in TAB_NAMES:
+                if basename.startswith(name + "_"):
+                    csv_files.append((name, csv_path))
+                    matched = True
+                    break
+            if not matched:
+                # Use the part before first digit-underscore as name
+                parts = basename.replace("_series_", "|").split("|")[0]
+                csv_files.append((parts, csv_path))
+
+    if not csv_files:
+        log.warning("  No matching indicator CSVs found — skipping Excel merge.")
+        return None
+
+    log.info(f"\n{'='*60}")
+    log.info(f"MERGING {len(csv_files)} indicators into single Excel workbook")
+    log.info(f"{'='*60}")
+
+    # Build the merged Excel
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    excel_path = os.path.join(OUTPUT_DIR,
+                              f"ALL_INDICATORS_{len(csv_files)}_tabs_{today_str}.xlsx")
+
+    # Build summary data as we go
+    summary_rows = []
+
+    try:
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+
+            # Reserve first sheet for summary (written last, inserted first)
+            tabs_written = 0
+
+            for indicator_name, csv_path in csv_files:
+                tab_name = TAB_NAMES.get(indicator_name, indicator_name[:31])
+
+                try:
+                    df = pd.read_csv(csv_path, index_col=0)
+
+                    if df.empty:
+                        log.warning(f"    {indicator_name}: CSV is empty, skipping tab")
+                        continue
+
+                    # Extract metadata columns vs date columns
+                    # Date columns start with "19" or "20" (YYYY-MM-DD format)
+                    date_cols = [c for c in df.columns if c[:2] in ("19", "20")]
+                    meta_cols = [c for c in df.columns if c not in date_cols]
+                    n_series = len(df)
+                    n_days = len(date_cols)
+
+                    # Collect summary info
+                    if date_cols:
+                        first_date = date_cols[0]
+                        last_date = date_cols[-1]
+                    else:
+                        first_date = last_date = "N/A"
+
+                    summary_rows.append({
+                        "Tab": tab_name,
+                        "Indicator": indicator_name,
+                        "Series": n_series,
+                        "Days": n_days,
+                        "First Date": first_date,
+                        "Last Date": last_date,
+                        "CSV File": os.path.basename(csv_path),
+                    })
+
+                    # Write the indicator data to its tab
+                    df.to_excel(writer, sheet_name=tab_name, index=True,
+                                index_label="Series", freeze_panes=(1, 1))
+
+                    tabs_written += 1
+                    log.info(f"    Tab '{tab_name}': {n_series} series x {n_days} days")
+
+                except Exception as e:
+                    log.warning(f"    {indicator_name}: failed to write tab — {e}")
+                    summary_rows.append({
+                        "Tab": tab_name, "Indicator": indicator_name,
+                        "Series": 0, "Days": 0,
+                        "First Date": "ERROR", "Last Date": str(e)[:40],
+                        "CSV File": os.path.basename(csv_path),
+                    })
+
+            # Write the Summary tab
+            if summary_rows:
+                summary_df = pd.DataFrame(summary_rows)
+                summary_df.index = range(1, len(summary_df) + 1)
+                summary_df.index.name = "#"
+
+                # Add totals row
+                totals = pd.DataFrame([{
+                    "Tab": "TOTAL",
+                    "Indicator": f"{tabs_written} indicators",
+                    "Series": summary_df["Series"].sum(),
+                    "Days": "",
+                    "First Date": summary_df[summary_df["First Date"] != "ERROR"]["First Date"].min()
+                                  if not summary_df.empty else "",
+                    "Last Date":  summary_df[summary_df["Last Date"].str.match(r"^\d{4}", na=False)]["Last Date"].max()
+                                  if not summary_df.empty else "",
+                    "CSV File": "",
+                }], index=[len(summary_df) + 1])
+                totals.index.name = "#"
+                summary_df = pd.concat([summary_df, totals])
+
+                summary_df.to_excel(writer, sheet_name="Summary", index=True)
+
+                # Move Summary to first position
+                wb = writer.book
+                summary_sheet = wb["Summary"]
+                wb.move_sheet(summary_sheet, offset=-(len(wb.sheetnames) - 1))
+
+                # Auto-size Summary columns
+                for col_cells in summary_sheet.columns:
+                    max_len = 0
+                    col_letter = col_cells[0].column_letter
+                    for cell in col_cells:
+                        if cell.value:
+                            max_len = max(max_len, len(str(cell.value)))
+                    summary_sheet.column_dimensions[col_letter].width = min(max_len + 3, 50)
+
+        log.info(f"\n  MERGED EXCEL SAVED: {excel_path}")
+        log.info(f"    {tabs_written} indicator tabs + 1 Summary tab")
+        log.info(f"    Total: {sum(r['Series'] for r in summary_rows if isinstance(r['Series'], int))} series")
+        return excel_path
+
+    except Exception as e:
+        log.error(f"  Excel merge failed: {e}")
+        return None
+
+
+# ===========================================================================
 # ENGINE (unchanged)
 # ===========================================================================
 
@@ -1286,6 +1668,8 @@ def extract_indicator(job):
             df = fetch_fred_multiple(series, START_DATE, END_DATE)
         elif st == "yfinance":
             df = fetch_yfinance_series(series, START_DATE, END_DATE)
+        elif st == "worldbank":
+            df = fetch_worldbank_series(series, START_DATE, END_DATE)
         if not df.empty:
             all_frames.append(df)
             log.info(f"    Got {df.shape[1]} series x {len(df)} days")
@@ -1314,19 +1698,190 @@ def extract_indicator(job):
     return combined
 
 def save_indicator(job, df):
+    """Save indicator data as CSV with SD stats + yearly overview + daily detail.
+
+    Output column layout:
+      A    Series (index)
+      B-F  Metadata: Description, Unit, Frequency, Asset Class, Region, etc.
+      G    SD Basis — "Daily" or "Yearly" (indicates which raw data was used)
+      H    SD Yearly
+      I    SD Half-Year
+      J    SD Quarterly
+      K    SD Monthly
+      L    SD Weekly
+      M    SD Daily
+      N    (blank separator)
+      O    (blank separator)
+      P    First year (e.g. 1976)
+      Q    Next year (e.g. 1977)
+      ...  one column per year through current year
+      ?    (blank separator)
+      ?    (blank separator)
+      ?+   Daily date columns: 1976-01-02, 1976-01-05, ...
+
+    SD calculation (returns-based):
+      Computes std of PERCENTAGE RETURNS (pct_change), not raw price levels.
+      This gives meaningful volatility measures:
+        e.g. SPY daily SD ≈ 1.2% (daily vol), yearly SD ≈ 18% (annual vol)
+
+      If the series has daily data with <20% gaps → "Daily" basis:
+        - Daily SD   = std of daily % returns
+        - Weekly SD  = std of weekly % returns (last value per week)
+        - Monthly SD = std of monthly % returns
+        - Quarterly  = std of quarterly % returns
+        - Half-Year  = std of semi-annual % returns
+        - Yearly SD  = std of annual % returns
+      If the series has >=20% gaps → "Yearly" basis:
+        - Yearly SD  = std of yearly % returns
+        - Others     = estimated by scaling DOWN: SD_freq = SD_yearly / sqrt(periods)
+    """
     if df.empty: return
     name, metadata = job["name"], job.get("metadata", {})
-    df_wide = df.transpose()
+
+    # ── df has DatetimeIndex (rows=dates, cols=series names)
+    df_sorted = df.sort_index()
+
+    # ── Compute Standard Deviations of RETURNS per series ─────────────────
+    sd_records = []
+
+    for col in df_sorted.columns:
+        series_data = df_sorted[col].dropna()
+        n_available = len(series_data)
+
+        record = {
+            "SD_Basis":     "",
+            "SD_Yearly":    "",
+            "SD_HalfYear":  "",
+            "SD_Quarterly": "",
+            "SD_Monthly":   "",
+            "SD_Weekly":    "",
+            "SD_Daily":     "",
+        }
+
+        if n_available < 3:
+            sd_records.append(record)
+            continue
+
+        # Determine gap ratio across the series' own date span
+        span_start = series_data.index.min()
+        span_end   = series_data.index.max()
+        expected_bdays = len(pd.bdate_range(span_start, span_end))
+        gap_ratio = 1.0 - (n_available / max(expected_bdays, 1))
+
+        if gap_ratio < 0.20 and n_available >= 30:
+            # ── DAILY BASIS: compute SD of returns at each frequency ──────
+            record["SD_Basis"] = "Daily"
+
+            # Daily returns
+            daily_ret = series_data.pct_change().dropna()
+            if len(daily_ret) >= 2:
+                record["SD_Daily"] = round(daily_ret.std() * 100, 4)  # as %
+
+            # Weekly returns (last value per week)
+            weekly = series_data.resample("W").last().dropna()
+            weekly_ret = weekly.pct_change().dropna()
+            if len(weekly_ret) >= 2:
+                record["SD_Weekly"] = round(weekly_ret.std() * 100, 4)
+
+            # Monthly returns
+            monthly = series_data.resample("ME").last().dropna()
+            monthly_ret = monthly.pct_change().dropna()
+            if len(monthly_ret) >= 2:
+                record["SD_Monthly"] = round(monthly_ret.std() * 100, 4)
+
+            # Quarterly returns
+            quarterly = series_data.resample("QE").last().dropna()
+            quarterly_ret = quarterly.pct_change().dropna()
+            if len(quarterly_ret) >= 2:
+                record["SD_Quarterly"] = round(quarterly_ret.std() * 100, 4)
+
+            # Half-year returns
+            halfyear = series_data.resample("6ME").last().dropna()
+            halfyear_ret = halfyear.pct_change().dropna()
+            if len(halfyear_ret) >= 2:
+                record["SD_HalfYear"] = round(halfyear_ret.std() * 100, 4)
+
+            # Yearly returns
+            yearly = series_data.resample("YE").last().dropna()
+            yearly_ret = yearly.pct_change().dropna()
+            if len(yearly_ret) >= 2:
+                record["SD_Yearly"] = round(yearly_ret.std() * 100, 4)
+
+        else:
+            # ── YEARLY BASIS: too many gaps, use annual returns + scale ────
+            record["SD_Basis"] = "Yearly"
+
+            yearly = series_data.resample("YE").last().dropna()
+            yearly_ret = yearly.pct_change().dropna()
+            if len(yearly_ret) >= 2:
+                sd_yr = yearly_ret.std() * 100  # as %
+                record["SD_Yearly"]    = round(sd_yr, 4)
+                # Scale DOWN: shorter periods have smaller return SD
+                # SD_freq ≈ SD_yearly / sqrt(periods_in_year)
+                record["SD_HalfYear"]  = round(sd_yr / (2 ** 0.5), 4)
+                record["SD_Quarterly"] = round(sd_yr / (4 ** 0.5), 4)
+                record["SD_Monthly"]   = round(sd_yr / (12 ** 0.5), 4)
+                record["SD_Weekly"]    = round(sd_yr / (52 ** 0.5), 4)
+                record["SD_Daily"]     = round(sd_yr / (252 ** 0.5), 4)
+
+        sd_records.append(record)
+
+    # Build SD DataFrame (same row index as transposed data)
+    sd_df = pd.DataFrame(sd_records, index=df_sorted.columns)
+
+    # ── Build the yearly overview (first available value per year per series)
+    years = sorted(df_sorted.index.year.unique())
+    yearly_data = {}
+    for year in years:
+        year_slice = df_sorted[df_sorted.index.year == year]
+        if year_slice.empty:
+            continue
+        first_vals = {}
+        for col in year_slice.columns:
+            col_data = year_slice[col].dropna()
+            if not col_data.empty:
+                first_vals[col] = col_data.iloc[0]
+            else:
+                first_vals[col] = None
+        yearly_data[str(year)] = first_vals
+
+    # ── Transpose daily data: series become rows, dates become columns
+    df_wide = df_sorted.transpose()
     df_wide.columns = pd.to_datetime(df_wide.columns).strftime("%Y-%m-%d")
+
+    # ── Build metadata columns
     mc = pd.DataFrame(index=df_wide.index)
     mc["Description"] = job["description"]
     mc["Unit"] = job.get("unit", "")
     mc["Frequency"] = job.get("frequency", "daily")
-    for k, v in metadata.items(): mc[k] = v
-    out = pd.concat([mc, df_wide], axis=1)
+    for k, v in metadata.items():
+        mc[k] = v
+
+    # ── Build yearly overview DataFrame
+    yearly_df = pd.DataFrame(yearly_data, index=df_wide.index)
+    yearly_cols = sorted(yearly_df.columns, key=lambda x: int(x))
+    yearly_df = yearly_df[yearly_cols]
+
+    # ── Build separator columns (2 blank columns between sections)
+    sep1 = pd.DataFrame({"  ": "", "   ": ""}, index=df_wide.index)
+    sep2 = pd.DataFrame({"    ": "", "     ": ""}, index=df_wide.index)
+
+    # ── Assemble: metadata | SD cols | sep | yearly overview | sep | daily
+    out = pd.concat([mc, sd_df, sep1, yearly_df, sep2, df_wide], axis=1)
+
+    n_meta   = len(mc.columns)
+    n_sd     = len(sd_df.columns)
+    n_yearly = len(yearly_df.columns)
+    n_daily  = len(df_wide.columns)
+
     fn = os.path.join(OUTPUT_DIR, f"{name}_{df.shape[1]}_series_{len(df)}_days.csv")
     out.to_csv(fn, index_label="Series")
-    log.info(f"\n  SAVED: {fn}\n    {df.shape[1]} series x {len(df)} days + {len(mc.columns)} meta cols")
+    log.info(f"\n  SAVED: {fn}")
+    log.info(f"    {df.shape[1]} series x {n_daily} daily dates")
+    log.info(f"    + {n_sd} SD columns (basis + 6 frequencies)")
+    log.info(f"    + {n_yearly} yearly overview columns ({yearly_cols[0]}-{yearly_cols[-1]})"
+             if yearly_cols else "    + 0 yearly columns")
+    log.info(f"    + {n_meta} metadata cols + 4 separator cols")
     save_indicator_cache(name, {"last_fetched": datetime.today().strftime("%Y-%m-%d %H:%M:%S"),
         "series_count": df.shape[1], "day_count": len(df), "file_path": fn,
         "date_range": f"{df.index.min().date()} -> {df.index.max().date()}"})
@@ -1340,13 +1895,15 @@ def print_summary(results):
                  f"{r['date_range']:<30} {'OK' if r['success'] else 'FAIL'}")
     log.info(f"\n  Total: {sum(1 for r in results if r['success'])}/{len(results)} OK")
 
-def run_all(jobs):
+def run_all(jobs, merge=True):
     results = []
+    extracted_names = []
     for i, job in enumerate(jobs, 1):
         log.info(f"\n[{i}/{len(jobs)}] Starting {job['name']}...")
         df = extract_indicator(job)
         if not df.empty:
             save_indicator(job, df)
+            extracted_names.append(job["name"])
             results.append({"name": job["name"], "success": True, "series": df.shape[1],
                             "days": len(df),
                             "date_range": f"{df.index.min().date()} -> {df.index.max().date()}"})
@@ -1356,20 +1913,29 @@ def run_all(jobs):
         if i < len(jobs): time.sleep(INTER_INDICATOR_DELAY)
     print_summary(results)
 
-def run_group(g):
+    # Merge all extracted CSVs into a single Excel workbook
+    if merge and extracted_names:
+        merge_to_excel(extracted_names)
+
+    return results
+
+def run_group(g, merge=True):
     g = g.lower()
     if g not in GROUPS:
         log.error(f"Unknown group '{g}'. Available: {list(GROUPS.keys())}"); return
     jobs = [j for j in INDICATOR_JOBS if j["name"] in GROUPS[g]]
     log.info(f"Group '{g}': {len(jobs)} indicators -> {GROUPS[g]}")
-    run_all(jobs)
+    run_all(jobs, merge=merge)
 
-def run_single(name):
+def run_single(name, merge=True):
     m = [j for j in INDICATOR_JOBS if j["name"].lower() == name.lower()]
     if not m:
         log.error(f"'{name}' not found. Available: {[j['name'] for j in INDICATOR_JOBS]}"); return
     df = extract_indicator(m[0])
-    if not df.empty: save_indicator(m[0], df)
+    if not df.empty:
+        save_indicator(m[0], df)
+        if merge:
+            merge_to_excel([m[0]["name"]])
 
 def list_indicators():
     print(f"\n{'='*75}\nAVAILABLE INDICATORS v6 — {len(INDICATOR_JOBS)} active\n{'='*75}\n")
@@ -1389,21 +1955,30 @@ if __name__ == "__main__":
         description="Global Indicator Data Extractor v6 — 23 Indicators",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="Examples:\n"
-               "  python extract_indicator_data.py                          # all 23\n"
-               "  python extract_indicator_data.py --group phase6           # 4 newest\n"
-               "  python extract_indicator_data.py --indicator GDP_GROWTH\n"
-               "  python extract_indicator_data.py --indicator EQUITY_INDICES\n"
-               "  python extract_indicator_data.py --indicator CONSUMER_SENTIMENT\n"
-               "  python extract_indicator_data.py --indicator SHIPPING_TRADE\n"
+               "  python extract_indicator_data.py                          # all 23 + merged Excel\n"
+               "  python extract_indicator_data.py --group phase6           # 4 newest + merged Excel\n"
+               "  python extract_indicator_data.py --indicator GDP_GROWTH   # single + merged Excel\n"
+               "  python extract_indicator_data.py --no-merge               # all 23, CSVs only\n"
                "  python extract_indicator_data.py --group commodities      # 7 indicators\n"
                "  python extract_indicator_data.py --group macro            # 10 indicators\n"
-               "  python extract_indicator_data.py --group indices          # equity benchmarks\n"
+               "  python extract_indicator_data.py --merge-only             # skip extraction, just merge existing CSVs\n"
                "  python extract_indicator_data.py --list\n")
-    p.add_argument("--indicator", type=str)
-    p.add_argument("--group", type=str)
-    p.add_argument("--list", action="store_true")
+    p.add_argument("--indicator", type=str, help="Single indicator name")
+    p.add_argument("--group", type=str, help="Group: commodities|rates|volatility|indices|macro|phase1-6|all")
+    p.add_argument("--list", action="store_true", help="List all indicators")
+    p.add_argument("--no-merge", action="store_true",
+                   help="Skip the merged Excel workbook (CSVs only)")
+    p.add_argument("--merge-only", action="store_true",
+                   help="Skip extraction — just merge existing output/ CSVs into Excel")
     args = p.parse_args()
-    if args.list: list_indicators()
-    elif args.indicator: run_single(args.indicator)
-    elif args.group: run_group(args.group)
-    else: run_all(INDICATOR_JOBS)
+
+    if args.list:
+        list_indicators()
+    elif args.merge_only:
+        merge_to_excel()
+    elif args.indicator:
+        run_single(args.indicator, merge=not args.no_merge)
+    elif args.group:
+        run_group(args.group, merge=not args.no_merge)
+    else:
+        run_all(INDICATOR_JOBS, merge=not args.no_merge)
