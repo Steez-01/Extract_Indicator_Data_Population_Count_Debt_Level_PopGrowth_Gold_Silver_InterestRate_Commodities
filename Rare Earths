@@ -1,19 +1,19 @@
 """
-Global Indicator Data Extractor v6 — 23 Active Indicators, 50-Year Daily
-=========================================================================
+Global Indicator Data Extractor v8 — 28 Active Indicators, Single Excel Output
+================================================================================
 
-23 indicators, ~370 series. Complete economic & financial coverage.
+28 indicators, ~500 series. Output: ONE Excel workbook (no separate CSVs).
 
   #  Indicator             Group         Category
   1  GOLD                  commodities   Precious metals
   2  BONDS                 rates         US+EU+UK+JP sovereign yields
   3  VIX                   volatility    Equity volatility
-  4  OIL                   commodities   Energy
+  4  OIL                   commodities   Energy (crude)
   5  SILVER                commodities   Precious metals
   6  METALS                commodities   Base & precious metals
   7  INTEREST_RATES        rates         Central bank policy rates
   8  CREDIT_SPREADS        rates         Credit risk / default
-  9  GOV_DEBT_LEVEL        macro         Government fiscal position
+  9  GOV_DEBT_LEVEL        macro         Government debt (% GDP)
   10 WORLD_LEVERAGE        macro         Money supply / credit
   11 RARE_EARTHS           commodities   Strategic minerals
   12 SEMICONDUCTORS        commodities   Tech supply chain
@@ -24,18 +24,23 @@ Global Indicator Data Extractor v6 — 23 Active Indicators, 50-Year Daily
   17 REAL_ESTATE           macro         Housing prices, starts, REITs
   18 EMPLOYMENT            macro         Jobless claims, unemployment
   19 AGRICULTURE           commodities   Wheat, corn, soy, coffee etc
-  20 GDP_GROWTH            macro         Top 30 GDP: growth + nominal   (v6 NEW, expanded)
-  21 EQUITY_INDICES        indices       S&P500, FTSE, DAX, Nikkei etc    (v6 NEW)
-  22 CONSUMER_SENTIMENT    macro         Confidence, PMI, LEI             (v6 NEW)
-  23 SHIPPING_TRADE        macro         Baltic Dry, trade balance        (v6 NEW)
+  20 GDP_GROWTH            macro         Top 30 GDP: growth + nominal + per capita
+  21 EQUITY_INDICES        indices       S&P500, FTSE, DAX, Nikkei etc
+  22 CONSUMER_SENTIMENT    macro         Confidence, PMI, LEI
+  23 SHIPPING_TRADE        macro         Baltic Dry, trade balance
+  24 COUNTRY_DEBT          macro         Govt debt in USD, 30 countries
+  25 EARNINGS_VALUATIONS   macro         Corporate profits, value vs growth  (v8 NEW)
+  26 ENERGY_EXTENDED       commodities   Natural gas, coal, uranium          (v8 NEW)
+  27 CURRENT_ACCOUNT       macro         Balance of payments, 30 countries   (v8 NEW)
+  28 DEFENSE_SPENDING      macro         Military expenditure, 30 countries  (v8 NEW)
+
+Output: single ALL_INDICATORS_28_tabs_YYYY-MM-DD.xlsx (no CSVs)
 
 Run:
-  python extract_indicator_data.py                      # all 23
-  python extract_indicator_data.py --group phase6       # 4 newest
-  python extract_indicator_data.py --group commodities   # 7 indicators
-  python extract_indicator_data.py --group macro         # 11 indicators
-  python extract_indicator_data.py --group indices       # equity benchmarks
-  python extract_indicator_data.py --indicator GDP_GROWTH
+  python extract_indicator_data.py                        # all 28 → Excel
+  python extract_indicator_data.py --group phase8         # 4 newest
+  python extract_indicator_data.py --indicator CURRENT_ACCOUNT
+  python extract_indicator_data.py --group macro          # 14 indicators
   python extract_indicator_data.py --list
 
 FRED API key (free): https://fred.stlouisfed.org/docs/api/api_key.html
@@ -84,6 +89,10 @@ def load_indicator_cache(n):
     return json.load(open(p)) if os.path.exists(p) else {}
 def save_indicator_cache(n, m):
     json.dump(m, open(get_cache_path(n),"w"), indent=2)
+
+# In-memory storage: save_indicator stores formatted DataFrames here,
+# merge_to_excel reads from here. No CSV files written.
+_INDICATOR_FRAMES = {}   # {indicator_name: pd.DataFrame (formatted, ready for Excel)}
 
 # --- FRED adapter ---------------------------------------------------------
 def fetch_fred_series(sid, start=START_DATE, end=END_DATE, name=None):
@@ -234,69 +243,205 @@ def fetch_worldbank_series(series_dict, start=START_DATE, end=END_DATE):
     return pd.DataFrame()
 
 
+# --- World Bank DEBT adapter (computes debt in USD) -----------------------
+# Government debt in local currency is useless for comparison. This adapter:
+#   1. Batch-fetches nominal GDP in current USD  (NY.GDP.MKTP.CD)
+#   2. Batch-fetches central government debt as % of GDP (GC.DOD.TOTL.GD.ZS)
+#   3. Computes: debt_USD = GDP_USD × (debt_pct / 100)
+# This automatically applies the correct exchange rate for each year because
+# the World Bank's GDP-in-USD series already handles currency conversion.
+#
+# Source type: "worldbank_debt"
+# Series dict format: {"US_Debt_USD": "USA"}  (just ISO3 code)
+
+def fetch_worldbank_debt_usd(series_dict, start=START_DATE, end=END_DATE):
+    """Fetch government debt in USD for multiple countries via World Bank.
+
+    Computes: GDP (current USD) × Debt-to-GDP ratio (%).
+    No API key needed. Uses batch API calls (2 calls total).
+
+    series_dict: {display_name: "ISO3"}  e.g. {"US_Debt_USD": "USA"}
+    """
+    start_year = int(start[:4])
+    end_year   = int(end[:4])
+
+    iso3_codes = list(series_dict.values())
+    name_lookup = {v: k for k, v in series_dict.items()}  # ISO3 → display_name
+    countries_str = ";".join(iso3_codes)
+
+    gdp_data = {}     # iso3 → {year_str: value}
+    debt_pct_data = {} # iso3 → {year_str: value}
+
+    # Fetch 1: Nominal GDP in current USD
+    gdp_indicator = "NY.GDP.MKTP.CD"
+    url_gdp = (f"https://api.worldbank.org/v2/country/{countries_str}"
+               f"/indicator/{gdp_indicator}"
+               f"?format=json&per_page=10000&date={start_year}:{end_year}")
+    log.info(f"   WB batch: GDP (current USD) for {len(iso3_codes)} countries...")
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(url_gdp, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = json.loads(resp.read())
+            if raw and len(raw) >= 2 and raw[1]:
+                for rec in raw[1]:
+                    iso3 = rec.get("countryiso3code") or rec.get("country", {}).get("id", "")
+                    year = rec.get("date")
+                    val  = rec.get("value")
+                    if iso3 and year and val is not None:
+                        try:
+                            if iso3 not in gdp_data: gdp_data[iso3] = {}
+                            gdp_data[iso3][year] = float(val)
+                        except (ValueError, TypeError): pass
+                log.info(f"   WB GDP: got data for {len(gdp_data)} countries")
+            break
+        except Exception as e:
+            log.warning(f"   WB GDP attempt {attempt}: {e}")
+            if attempt < RETRY_ATTEMPTS: time.sleep(5 * attempt)
+
+    time.sleep(1)
+
+    # Fetch 2: Central government debt as % of GDP
+    debt_indicator = "GC.DOD.TOTL.GD.ZS"
+    url_debt = (f"https://api.worldbank.org/v2/country/{countries_str}"
+                f"/indicator/{debt_indicator}"
+                f"?format=json&per_page=10000&date={start_year}:{end_year}")
+    log.info(f"   WB batch: Debt-to-GDP (%) for {len(iso3_codes)} countries...")
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(url_debt, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = json.loads(resp.read())
+            if raw and len(raw) >= 2 and raw[1]:
+                for rec in raw[1]:
+                    iso3 = rec.get("countryiso3code") or rec.get("country", {}).get("id", "")
+                    year = rec.get("date")
+                    val  = rec.get("value")
+                    if iso3 and year and val is not None:
+                        try:
+                            if iso3 not in debt_pct_data: debt_pct_data[iso3] = {}
+                            debt_pct_data[iso3][year] = float(val)
+                        except (ValueError, TypeError): pass
+                log.info(f"   WB Debt%: got data for {len(debt_pct_data)} countries")
+            break
+        except Exception as e:
+            log.warning(f"   WB Debt% attempt {attempt}: {e}")
+            if attempt < RETRY_ATTEMPTS: time.sleep(5 * attempt)
+
+    # Compute: debt_USD = GDP_USD × (debt_pct / 100)
+    frames = []
+    for iso3, display_name in name_lookup.items():
+        if iso3 not in gdp_data or iso3 not in debt_pct_data:
+            log.debug(f"   WB debt: missing GDP or debt% for {iso3}")
+            continue
+
+        values = {}
+        for year in gdp_data[iso3]:
+            if year in debt_pct_data[iso3]:
+                gdp_usd = gdp_data[iso3][year]
+                debt_pct = debt_pct_data[iso3][year]
+                debt_usd = gdp_usd * (debt_pct / 100.0)
+                values[f"{year}-01-01"] = debt_usd
+
+        if values:
+            s = pd.Series(values, name=display_name)
+            s.index = pd.to_datetime(s.index)
+            s = s.sort_index()
+            frames.append(s)
+            log.info(f"   WB debt {iso3}: {len(s)} years "
+                     f"({s.index.min().year} -> {s.index.max().year}), "
+                     f"latest=${s.iloc[-1]/1e9:.1f}B")
+
+    n_got = len(frames)
+    log.info(f"   WB debt: computed USD debt for {n_got}/{len(iso3_codes)} countries")
+
+    if frames:
+        df = pd.concat(frames, axis=1)
+        df.index = pd.to_datetime(df.index)
+        return df.sort_index()
+    return pd.DataFrame()
+
+
 # ===========================================================================
-# 15 ACTIVE INDICATOR JOBS
+# 24 ACTIVE INDICATOR JOBS
 # ===========================================================================
 
 INDICATOR_JOBS = [
 
-    # 1. GOLD
-    {"name": "GOLD", "description": "Gold Spot Price — USD/oz (London Fix + Futures)",
-     "group": "commodities", "unit": "USD/oz", "frequency": "daily",
+    # 1. BONDS — Securities & Risk: Sovereign Yields + Gold/Silver + VIX + Credit Spreads
+    # Merges 5 former indicators into one tab:
+    #   - Sovereign bond yields (US 1M-30Y, EU/UK/JP 10Y+3M)
+    #   - Safe havens (Gold, Silver — London fix + futures)
+    #   - Volatility (VIX term structure + VVIX)
+    #   - Credit spreads (ICE BofA AAA-CCC OAS + TED + yield curve)
+    #   - Bond & credit ETFs
+    {"name": "BONDS",
+     "description": "Securities & Risk — Sovereign Yields, Gold, Silver, VIX, Credit Spreads (Daily)",
+     "group": "rates", "unit": "various", "frequency": "daily",
      "sources": [
+         # ── FRED source 1: Sovereign yields + Gold/Silver + VIX + Credit ──
          {"type": "fred", "series": {
-             "Gold_London_AM_Fix": "GOLDAMGBD228NLBM",
-             "Gold_London_PM_Fix": "GOLDPMGBD228NLBM",
-         }, "priority": 1, "note": "LBMA fixing — daily since 1968"},
-         {"type": "yfinance", "series": {
-             "Gold_Futures_COMEX": "GC=F", "Gold_ETF_GLD": "GLD",
-         }, "priority": 2, "note": "COMEX futures + GLD ETF"},
-     ], "metadata": {"Asset Class": "Precious Metals", "Region": "Global", "Currency": "USD"}},
-
-    # 2. BONDS — merged US + EU + UK + JP sovereign yields
-    {"name": "BONDS", "description": "Global Sovereign Bond Yields — US 1M-30Y + EU/UK/JP 10Y+3M (Daily %)",
-     "group": "rates", "unit": "percent / USD", "frequency": "daily",
-     "sources": [
-         {"type": "fred", "series": {
+             # US Treasury Constant Maturity yields
              "US_Treasury_1M": "DGS1MO", "US_Treasury_3M": "DGS3MO",
              "US_Treasury_6M": "DGS6MO", "US_Treasury_1Y": "DGS1",
              "US_Treasury_2Y": "DGS2",   "US_Treasury_3Y": "DGS3",
              "US_Treasury_5Y": "DGS5",   "US_Treasury_7Y": "DGS7",
              "US_Treasury_10Y": "DGS10", "US_Treasury_20Y": "DGS20",
              "US_Treasury_30Y": "DGS30",
+             # European + UK + Japan sovereign 10Y
              "Germany_10Y": "IRLTLT01DEM156N", "France_10Y": "IRLTLT01FRM156N",
              "Italy_10Y":   "IRLTLT01ITM156N", "Spain_10Y":  "IRLTLT01ESM156N",
              "UK_10Y":      "IRLTLT01GBM156N", "Netherlands_10Y": "IRLTLT01NLM156N",
              "Belgium_10Y": "IRLTLT01BEM156N", "Austria_10Y": "IRLTLT01ATM156N",
              "Japan_10Y":   "IRLTLT01JPM156N",
+             # European + UK 3M interbank rates
              "Germany_3M": "IR3TIB01DEM156N", "France_3M": "IR3TIB01FRM156N",
              "Italy_3M":   "IR3TIB01ITM156N", "Spain_3M":  "IR3TIB01ESM156N",
              "UK_3M":      "IR3TIB01GBM156N", "UK_20Y":    "IRLTLT02GBM156N",
-         }, "priority": 1, "note": "US H.15 yields (1962->) + OECD EU/UK/JP (1970s->). 26 series."},
+             # Gold & Silver (London Fix)
+             "Gold_London_AM_Fix": "GOLDAMGBD228NLBM",
+             "Gold_London_PM_Fix": "GOLDPMGBD228NLBM",
+             "Silver_London_Fix":  "SLVPRUSD",
+             # VIX
+             "VIX_CBOE": "VIXCLS",
+             # Credit Spreads (ICE BofA OAS)
+             "US_IG_OAS": "BAMLC0A0CM",     "US_HY_OAS": "BAMLH0A0HYM2",
+             "US_AAA_OAS": "BAMLC0A1CAAA",  "US_AA_OAS": "BAMLC0A2CAA",
+             "US_A_OAS": "BAMLC0A3CA",      "US_BBB_OAS": "BAMLC0A4CBBB",
+             "US_CCC_OAS": "BAMLH0A3HYC",   "EM_Corporate_OAS": "BAMLEMCBPIOAS",
+             # Stress indicators
+             "TED_Spread": "TEDRATE",
+             "US_10Y_minus_2Y": "T10Y2Y", "US_10Y_minus_3M": "T10Y3M",
+         }, "priority": 1,
+          "note": "US yields (1962->), EU/UK/JP yields (1970s->), Gold/Silver fix (1968->), "
+                  "VIX (1990->), ICE BofA credit spreads (1996->). ~40 FRED series."},
+         # ── yfinance source 2: ETFs + futures + indices ──────────────────
          {"type": "yfinance", "series": {
+             # US yield indices
              "US_5Y_idx": "^FVX",  "US_10Y_idx": "^TNX",
              "US_30Y_idx": "^TYX", "US_13W_idx": "^IRX",
+             # Bond ETFs
              "TLT_20Y_ETF": "TLT", "IEF_7_10Y_ETF": "IEF",
              "SHY_1_3Y_ETF": "SHY", "GOVT_All_ETF": "GOVT",
              "EU_Gov_1_3Y": "IBGS.L", "EU_Gov_7_10Y": "IBGL.L",
              "EU_Gov_15_30Y": "IBGX.L",
              "UK_Gilt_0_5Y": "IGLS.L", "UK_Gilt_All": "IGLT.L",
-         }, "priority": 2, "note": "CBOE yield indices + US/EU/UK bond ETFs"},
-     ], "metadata": {"Asset Class": "Sovereign Fixed Income",
-                     "Region": "US + Europe + UK + Japan"}},
-
-    # 3. VIX
-    {"name": "VIX", "description": "CBOE Volatility Index + Term Structure",
-     "group": "volatility", "unit": "index points", "frequency": "daily",
-     "sources": [
-         {"type": "fred", "series": {"VIX_CBOE": "VIXCLS"}, "priority": 1},
-         {"type": "yfinance", "series": {
+             # Gold & Silver
+             "Gold_Futures_COMEX": "GC=F", "Gold_ETF_GLD": "GLD",
+             "Silver_Futures_COMEX": "SI=F", "Silver_ETF_SLV": "SLV",
+             # VIX term structure
              "VIX_CBOE": "^VIX", "VIX9D": "^VIX9D", "VIX3M": "^VIX3M",
              "VIX6M": "^VIX6M", "VVIX": "^VVIX",
-         }, "priority": 2, "note": "VIX term structure + VVIX"},
-     ], "metadata": {"Asset Class": "Volatility", "Region": "US"}},
+             # Credit ETFs
+             "HYG_HY_Corp": "HYG", "JNK_HY_Corp": "JNK",
+             "LQD_IG_Corp": "LQD", "EMB_EM_Bond": "EMB",
+             "BKLN_SeniorLoan": "BKLN", "ANGL_FallenAngels": "ANGL",
+         }, "priority": 2,
+          "note": "Yield indices, bond/credit ETFs, gold/silver futures, VIX term structure."},
+     ], "metadata": {"Asset Class": "Securities & Risk Management",
+                     "Region": "Global"}},
 
-    # 4. OIL
+    # 2. OIL
     {"name": "OIL", "description": "Crude Oil + Energy — WTI, Brent, NatGas, Heating Oil",
      "group": "commodities", "unit": "USD/barrel", "frequency": "daily",
      "sources": [
@@ -309,18 +454,7 @@ INDICATOR_JOBS = [
          }, "priority": 2, "note": "NYMEX/ICE futures"},
      ], "metadata": {"Asset Class": "Energy", "Region": "Global", "Currency": "USD"}},
 
-    # 5. SILVER
-    {"name": "SILVER", "description": "Silver Spot Price — USD/oz (London Fix + Futures)",
-     "group": "commodities", "unit": "USD/oz", "frequency": "daily",
-     "sources": [
-         {"type": "fred", "series": {"Silver_London_Fix": "SLVPRUSD"},
-          "priority": 1, "note": "LBMA — daily since 1968"},
-         {"type": "yfinance", "series": {
-             "Silver_Futures_COMEX": "SI=F", "Silver_ETF_SLV": "SLV",
-         }, "priority": 2},
-     ], "metadata": {"Asset Class": "Precious Metals", "Region": "Global", "Currency": "USD"}},
-
-    # 6. METALS
+    # 3. METALS
     {"name": "METALS", "description": "Base & Precious Metals — Cu, Pt, Pd, Al, Ni, Zn, Sn, Fe",
      "group": "commodities", "unit": "various", "frequency": "daily+monthly",
      "sources": [
@@ -336,7 +470,7 @@ INDICATOR_JOBS = [
          }, "priority": 2, "note": "IMF/WB monthly since 1960"},
      ], "metadata": {"Asset Class": "Metals", "Region": "Global", "Currency": "USD"}},
 
-    # 7. INTEREST_RATES
+    # 4. INTEREST_RATES
     {"name": "INTEREST_RATES",
      "description": "Central Bank Policy Rates — Fed, ECB, BOE, BOJ + SOFR, Prime, Mortgage",
      "group": "rates", "unit": "percent", "frequency": "daily",
@@ -357,48 +491,57 @@ INDICATOR_JOBS = [
      ], "metadata": {"Asset Class": "Central Bank Rates",
                      "Region": "US, Eurozone, UK, Japan, Canada, Australia"}},
 
-    # 8. CREDIT_SPREADS
-    {"name": "CREDIT_SPREADS",
-     "description": "Credit Spreads & Default Risk — ICE BofA OAS (AAA-CCC) + Stress Indicators",
-     "group": "rates", "unit": "percent/bps", "frequency": "daily",
-     "sources": [
-         {"type": "fred", "series": {
-             "US_IG_OAS": "BAMLC0A0CM",     "US_HY_OAS": "BAMLH0A0HYM2",
-             "US_AAA_OAS": "BAMLC0A1CAAA",  "US_AA_OAS": "BAMLC0A2CAA",
-             "US_A_OAS": "BAMLC0A3CA",      "US_BBB_OAS": "BAMLC0A4CBBB",
-             "US_CCC_OAS": "BAMLH0A3HYC",   "EM_Corporate_OAS": "BAMLEMCBPIOAS",
-             "TED_Spread": "TEDRATE",
-             "US_10Y_minus_2Y": "T10Y2Y", "US_10Y_minus_3M": "T10Y3M",
-         }, "priority": 1, "note": "ICE BofA OAS (since 1996) + yield curve spreads"},
-         {"type": "yfinance", "series": {
-             "HYG_HY_Corp": "HYG", "JNK_HY_Corp": "JNK",
-             "LQD_IG_Corp": "LQD", "EMB_EM_Bond": "EMB",
-             "BKLN_SeniorLoan": "BKLN", "ANGL_FallenAngels": "ANGL",
-         }, "priority": 2, "note": "Credit bond ETFs (2002-2012 onward)"},
-     ], "metadata": {"Asset Class": "Credit Spreads", "Region": "US + EM"}},
-
-    # 9. GOV_DEBT_LEVEL
+    # 9. GOV_DEBT_LEVEL — Debt-to-GDP Ratio, 30 Countries
+    # World Bank: GC.DOD.TOTL.GD.ZS = Central government debt (% of GDP)
+    # NO API KEY NEEDED. Annual since ~1970-1990 depending on country.
+    # Same 30 countries as GDP_GROWTH, COUNTRY_DEBT, CURRENT_ACCOUNT, DEFENSE_SPENDING.
     {"name": "GOV_DEBT_LEVEL",
-     "description": "Government Debt-to-GDP — 20 Countries (Quarterly/Annual %)",
-     "group": "macro", "unit": "% of GDP", "frequency": "quarterly",
+     "description": "Government Debt-to-GDP Ratio — 30 Countries (Annual % since ~1970)",
+     "group": "macro", "unit": "% of GDP", "frequency": "annual",
      "sources": [
+         {"type": "worldbank", "series": {
+             "US_DebtToGDP":           "USA/GC.DOD.TOTL.GD.ZS",
+             "China_DebtToGDP":       "CHN/GC.DOD.TOTL.GD.ZS",
+             "Germany_DebtToGDP":     "DEU/GC.DOD.TOTL.GD.ZS",
+             "Japan_DebtToGDP":       "JPN/GC.DOD.TOTL.GD.ZS",
+             "UK_DebtToGDP":          "GBR/GC.DOD.TOTL.GD.ZS",
+             "India_DebtToGDP":       "IND/GC.DOD.TOTL.GD.ZS",
+             "France_DebtToGDP":      "FRA/GC.DOD.TOTL.GD.ZS",
+             "Italy_DebtToGDP":       "ITA/GC.DOD.TOTL.GD.ZS",
+             "Russia_DebtToGDP":      "RUS/GC.DOD.TOTL.GD.ZS",
+             "Brazil_DebtToGDP":      "BRA/GC.DOD.TOTL.GD.ZS",
+             "Canada_DebtToGDP":      "CAN/GC.DOD.TOTL.GD.ZS",
+             "Australia_DebtToGDP":   "AUS/GC.DOD.TOTL.GD.ZS",
+             "Mexico_DebtToGDP":      "MEX/GC.DOD.TOTL.GD.ZS",
+             "Spain_DebtToGDP":       "ESP/GC.DOD.TOTL.GD.ZS",
+             "SouthKorea_DebtToGDP":  "KOR/GC.DOD.TOTL.GD.ZS",
+             "Turkey_DebtToGDP":      "TUR/GC.DOD.TOTL.GD.ZS",
+             "Indonesia_DebtToGDP":   "IDN/GC.DOD.TOTL.GD.ZS",
+             "Netherlands_DebtToGDP": "NLD/GC.DOD.TOTL.GD.ZS",
+             "SaudiArabia_DebtToGDP": "SAU/GC.DOD.TOTL.GD.ZS",
+             "Switzerland_DebtToGDP": "CHE/GC.DOD.TOTL.GD.ZS",
+             "Poland_DebtToGDP":      "POL/GC.DOD.TOTL.GD.ZS",
+             "Taiwan_DebtToGDP":      "TWN/GC.DOD.TOTL.GD.ZS",
+             "Ireland_DebtToGDP":     "IRL/GC.DOD.TOTL.GD.ZS",
+             "Belgium_DebtToGDP":     "BEL/GC.DOD.TOTL.GD.ZS",
+             "Sweden_DebtToGDP":      "SWE/GC.DOD.TOTL.GD.ZS",
+             "Israel_DebtToGDP":      "ISR/GC.DOD.TOTL.GD.ZS",
+             "Argentina_DebtToGDP":   "ARG/GC.DOD.TOTL.GD.ZS",
+             "Singapore_DebtToGDP":   "SGP/GC.DOD.TOTL.GD.ZS",
+             "Austria_DebtToGDP":     "AUT/GC.DOD.TOTL.GD.ZS",
+             "UAE_DebtToGDP":         "ARE/GC.DOD.TOTL.GD.ZS",
+         }, "priority": 1,
+          "note": "World Bank API (NO KEY). Central government debt as % of GDP. "
+                  "30 countries, annual since ~1970-1990. Japan ~250%, US ~120%, Germany ~65%."},
          {"type": "fred", "series": {
-             "US_FedDebt_GDP": "GFDEGDQ188S", "US_FedDebt_Total_M": "GFDEBTN",
-             "Japan_Debt_GDP": "JPNGGXWDGG01GDPPT", "Germany_Debt_GDP": "DEUGGXWDGG01GDPPT",
-             "UK_Debt_GDP": "GBRGGXWDGG01GDPPT", "France_Debt_GDP": "FRAGGXWDGG01GDPPT",
-             "Italy_Debt_GDP": "ITAGGXWDGG01GDPPT", "Canada_Debt_GDP": "CANGGXWDGG01GDPPT",
-             "Australia_Debt_GDP": "AUSGGXWDGG01GDPPT", "Brazil_Debt_GDP": "BRAGGXWDGG01GDPPT",
-             "India_Debt_GDP": "INDGGXWDGG01GDPPT", "China_Debt_GDP": "CHNGGXWDGG01GDPPT",
-             "Spain_Debt_GDP": "ESPGGXWDGG01GDPPT", "Mexico_Debt_GDP": "MEXGGXWDGG01GDPPT",
-             "SKorea_Debt_GDP": "KORGGXWDGG01GDPPT", "Netherlands_Debt_GDP": "NLDGGXWDGG01GDPPT",
-             "Switzerland_Debt_GDP": "CHEGGXWDGG01GDPPT", "Sweden_Debt_GDP": "SWEGGXWDGG01GDPPT",
-             "Belgium_Debt_GDP": "BELGGXWDGG01GDPPT", "Austria_Debt_GDP": "AUTGGXWDGG01GDPPT",
-             "Norway_Debt_GDP": "NORGGXWDGG01GDPPT",
-         }, "priority": 1, "note": "US since 1966 + OECD since ~1995 for 20 countries"},
+             "US_FedDebt_GDP_Q": "GFDEGDQ188S",
+         }, "priority": 2,
+          "note": "US federal debt/GDP quarterly since 1966 (needs FRED key)."},
          {"type": "yfinance", "series": {
              "TLT_LongBond": "TLT", "IEF_MedBond": "IEF", "SHY_ShortBond": "SHY",
-         }, "priority": 2, "note": "Treasury ETFs as fiscal-stress proxies"},
-     ], "metadata": {"Asset Class": "Macro — Fiscal", "Region": "Global (20 countries)"}},
+         }, "priority": 3, "note": "Treasury ETFs as fiscal-stress proxies"},
+     ], "metadata": {"Asset Class": "Macro — Government Debt (% GDP)",
+                     "Region": "Top 30 GDP countries (2025 ranking)"}},
 
     # 10. WORLD_LEVERAGE
     {"name": "WORLD_LEVERAGE",
@@ -1407,6 +1550,337 @@ INDICATOR_JOBS = [
      ], "metadata": {"Asset Class": "Macro — Global Trade & Shipping",
                      "Region": "Global", "Currency": "USD"}},
 
+    # ==================================================================
+    # 24. COUNTRY_DEBT — Government Debt in USD for 30 Countries
+    # ==================================================================
+    # Computes: GDP (current USD) × Central Government Debt (% of GDP)
+    # This automatically handles currency conversion because the World Bank's
+    # GDP series is already in current USD using that year's exchange rate.
+    #
+    # World Bank API (NO API KEY) — only 2 batch HTTP calls:
+    #   Call 1: NY.GDP.MKTP.CD    — Nominal GDP in current USD
+    #   Call 2: GC.DOD.TOTL.GD.ZS — Central government debt as % of GDP
+    #   Then:   debt_USD = GDP_USD × (debt_pct / 100)
+    #
+    # Coverage: most countries have data since ~1990-2000.
+    # Some (US, UK, France) go back to 1970s. Gaps are normal for
+    # countries that didn't report to the IMF/WB in certain years.
+    {"name": "COUNTRY_DEBT",
+     "description": "Government Debt in USD — 30 Countries (Annual, computed: GDP×Debt/GDP ratio)",
+     "group": "macro", "unit": "current USD", "frequency": "annual",
+     "sources": [
+         {"type": "worldbank_debt", "series": {
+             "US_Debt_USD":          "USA",
+             "China_Debt_USD":       "CHN",
+             "Germany_Debt_USD":     "DEU",
+             "Japan_Debt_USD":       "JPN",
+             "UK_Debt_USD":          "GBR",
+             "India_Debt_USD":       "IND",
+             "France_Debt_USD":      "FRA",
+             "Italy_Debt_USD":       "ITA",
+             "Russia_Debt_USD":      "RUS",
+             "Brazil_Debt_USD":      "BRA",
+             "Canada_Debt_USD":      "CAN",
+             "Australia_Debt_USD":   "AUS",
+             "Mexico_Debt_USD":      "MEX",
+             "Spain_Debt_USD":       "ESP",
+             "SouthKorea_Debt_USD":  "KOR",
+             "Turkey_Debt_USD":      "TUR",
+             "Indonesia_Debt_USD":   "IDN",
+             "Netherlands_Debt_USD": "NLD",
+             "SaudiArabia_Debt_USD": "SAU",
+             "Switzerland_Debt_USD": "CHE",
+             "Poland_Debt_USD":      "POL",
+             "Taiwan_Debt_USD":      "TWN",
+             "Ireland_Debt_USD":     "IRL",
+             "Belgium_Debt_USD":     "BEL",
+             "Sweden_Debt_USD":      "SWE",
+             "Israel_Debt_USD":      "ISR",
+             "Argentina_Debt_USD":   "ARG",
+             "Singapore_Debt_USD":   "SGP",
+             "Austria_Debt_USD":     "AUT",
+             "UAE_Debt_USD":         "ARE",
+         }, "priority": 1,
+          "note": "World Bank API (NO KEY). 2 batch calls: GDP in USD + debt-to-GDP %. "
+                  "Computes debt_USD = GDP × (debt%/100). Exchange rate conversion is automatic "
+                  "because WB GDP is already in current-year USD."},
+     ], "metadata": {"Asset Class": "Macro — Government Debt (USD)",
+                     "Region": "Top 30 GDP countries (2025 ranking)",
+                     "Currency": "USD (current, exchange-rate converted)"}},
+
+    # ==================================================================
+    # ==================================================================
+    # ===  PHASE 8 — 4 NEW INDICATORS  ================================
+    # ==================================================================
+    # ==================================================================
+
+    # ==================================================================
+    # 25. EARNINGS_VALUATIONS — PE, CAPE, Earnings Yield, Corp Profits
+    # ==================================================================
+    # Essential for equity valuation — tells you whether stocks are cheap
+    # or expensive relative to what companies actually earn.
+    #
+    # FRED:
+    #   MULTPL/CAPE = Shiller CAPE ratio (monthly since 1881 — 145 years!)
+    #     Not directly on FRED, but available via yfinance or computed.
+    #   A053RC1Q027SBEA = Corporate profits after tax (quarterly since 1947)
+    #   CP = Corporate profits with IVA+CCAdj (quarterly since 1947)
+    #   W398RC1A027NBEA = Corporate profits as % of GDP (annual since 1929)
+    #   BOGZ1FL103164103Q = Nonfinancial corporate profits (quarterly)
+    #   SP500_PE_RATIO_MONTH = S&P 500 PE ratio (via Multpl, not FRED)
+    #
+    # yfinance:
+    #   CAPE = Barclays Shiller CAPE ETF (2018->)
+    #   IUSV = iShares Core S&P US Value (value/PE proxy)
+    #   SPYV = SPDR S&P 500 Value (low PE stocks)
+    #   SPYG = SPDR S&P 500 Growth (high PE stocks)
+    #   RPV  = Invesco S&P 500 Pure Value (deepest value)
+    #   VTV  = Vanguard Value ETF
+    #   VLUE = iShares MSCI USA Value Factor
+    {"name": "EARNINGS_VALUATIONS",
+     "description": "Equity Valuations — Corporate Profits, Value vs Growth, PE Proxies (Quarterly since 1947)",
+     "group": "macro", "unit": "billions USD / ratio / USD", "frequency": "quarterly + daily",
+     "sources": [
+         {"type": "fred", "series": {
+             "US_CorpProfits_AfterTax":    "A053RC1Q027SBEA",
+             "US_CorpProfits_IVA_CCAdj":   "CP",
+             "US_CorpProfits_Pct_GDP":     "W398RC1A027NBEA",
+             "US_Nonfin_CorpProfits":      "BOGZ1FL103164103Q",
+             "US_CorpProfits_Domestic":    "A446RC1Q027SBEA",
+         }, "priority": 1,
+          "note": "US Corporate Profits quarterly since 1947, % of GDP since 1929. "
+                  "Fed Z.1 nonfinancial sector profits."},
+         {"type": "yfinance", "series": {
+             "SPYV_SP500_Value":      "SPYV",
+             "SPYG_SP500_Growth":     "SPYG",
+             "VTV_Vanguard_Value":    "VTV",
+             "VLUE_MSCI_ValueFactor": "VLUE",
+             "RPV_PureValue":         "RPV",
+             "IUSV_CoreValue":        "IUSV",
+             "CAPE_ShillerCALE_ETF":  "CAPE",
+         }, "priority": 2,
+          "note": "Value vs Growth ETFs as PE proxy. SPYV/SPYG ratio = value/growth spread. "
+                  "When Value outperforms, market is rotating to low-PE stocks."},
+     ], "metadata": {"Asset Class": "Macro — Equity Valuations",
+                     "Region": "United States", "Currency": "USD"}},
+
+    # ==================================================================
+    # 26. ENERGY_EXTENDED — Natural Gas, Coal, Uranium
+    # ==================================================================
+    # OIL covers crude oil. This covers the rest of the energy complex:
+    # natural gas (Henry Hub US + TTF Europe), thermal coal, uranium.
+    #
+    # yfinance:
+    #   NG=F  Henry Hub Natural Gas (already in OIL, but included here for
+    #         the dedicated energy tab — OIL focuses on crude)
+    #   TTF=F European TTF Natural Gas (ICE, EUR/MWh, since ~2015)
+    #   URA   Global X Uranium ETF (2010->)
+    #   URNM  Sprott Uranium Miners ETF (2019->)
+    #   UEC   Uranium Energy Corp (2005->)
+    #   CCJ   Cameco Corp — largest uranium producer (1996->)
+    #   BTU   Peabody Energy — largest US coal producer (2001->)
+    #   ARCH  Arch Resources — US coal (2001->)
+    #   XLE   Energy Select Sector SPDR (1998->)
+    #
+    # FRED:
+    #   DHHNGSP  Henry Hub Natural Gas spot (daily since 1997)
+    #   PNGASEUUSDM  EU Natural Gas price (monthly since 1991)
+    #   PCOALAUUSDM  Coal, Australian thermal (monthly since 1970)
+    #   PURANUSDM    Uranium, NUEXCO (monthly since 1981)
+    {"name": "ENERGY_EXTENDED",
+     "description": "Energy Extended — Natural Gas (US+EU), Coal, Uranium (Daily+Monthly since 1970)",
+     "group": "commodities", "unit": "USD/MMBtu, USD/mt, USD/lb", "frequency": "daily + monthly",
+     "sources": [
+         {"type": "fred", "series": {
+             "NatGas_HenryHub_Spot":   "DHHNGSP",
+             "NatGas_EU_Monthly":      "PNGASEUUSDM",
+             "Coal_Australian_Monthly":"PCOALAUUSDM",
+             "Uranium_NUEXCO_Monthly": "PURANUSDM",
+         }, "priority": 1,
+          "note": "Henry Hub daily since 1997. EU gas monthly since 1991. "
+                  "Coal since 1970 (56 years!). Uranium since 1981."},
+         {"type": "yfinance", "series": {
+             "NatGas_HenryHub_Futures": "NG=F",
+             "URA_Uranium_ETF":        "URA",
+             "CCJ_Cameco_Uranium":     "CCJ",
+             "UEC_UraniumEnergy":      "UEC",
+             "BTU_Peabody_Coal":       "BTU",
+             "ARCH_ArchResources_Coal":"ARCH",
+             "XLE_Energy_Sector":      "XLE",
+         }, "priority": 2,
+          "note": "Natural gas futures, uranium miners (CCJ since 1996), "
+                  "coal producers (BTU/ARCH), XLE broad energy sector."},
+     ], "metadata": {"Asset Class": "Energy — Gas, Coal, Uranium",
+                     "Region": "Global", "Currency": "USD"}},
+
+    # ==================================================================
+    # 27. CURRENT_ACCOUNT — Balance of Payments 30 Countries
+    # ==================================================================
+    # Current account balance = exports - imports + net income + transfers.
+    # Positive = net creditor (China, Germany, Japan).
+    # Negative = net debtor (US, UK, India).
+    # Complements COUNTRY_DEBT and GDP_GROWTH for full fiscal picture.
+    #
+    # World Bank: BN.CAB.XOKA.CD — Current account balance (current USD)
+    #             BN.CAB.XOKA.GD.ZS — Current account balance (% of GDP)
+    # Annual since ~1970 for most countries. Same 30 countries.
+    {"name": "CURRENT_ACCOUNT",
+     "description": "Current Account Balance — 30 Countries in USD + % of GDP (Annual since ~1970)",
+     "group": "macro", "unit": "current USD / % of GDP", "frequency": "annual",
+     "sources": [
+         {"type": "worldbank", "series": {
+             # Current Account Balance in USD
+             "US_CA_USD":           "USA/BN.CAB.XOKA.CD",
+             "China_CA_USD":       "CHN/BN.CAB.XOKA.CD",
+             "Germany_CA_USD":     "DEU/BN.CAB.XOKA.CD",
+             "Japan_CA_USD":       "JPN/BN.CAB.XOKA.CD",
+             "UK_CA_USD":          "GBR/BN.CAB.XOKA.CD",
+             "India_CA_USD":       "IND/BN.CAB.XOKA.CD",
+             "France_CA_USD":      "FRA/BN.CAB.XOKA.CD",
+             "Italy_CA_USD":       "ITA/BN.CAB.XOKA.CD",
+             "Russia_CA_USD":      "RUS/BN.CAB.XOKA.CD",
+             "Brazil_CA_USD":      "BRA/BN.CAB.XOKA.CD",
+             "Canada_CA_USD":      "CAN/BN.CAB.XOKA.CD",
+             "Australia_CA_USD":   "AUS/BN.CAB.XOKA.CD",
+             "Mexico_CA_USD":      "MEX/BN.CAB.XOKA.CD",
+             "Spain_CA_USD":       "ESP/BN.CAB.XOKA.CD",
+             "SKorea_CA_USD":      "KOR/BN.CAB.XOKA.CD",
+             "Turkey_CA_USD":      "TUR/BN.CAB.XOKA.CD",
+             "Indonesia_CA_USD":   "IDN/BN.CAB.XOKA.CD",
+             "Netherlands_CA_USD": "NLD/BN.CAB.XOKA.CD",
+             "SaudiArabia_CA_USD": "SAU/BN.CAB.XOKA.CD",
+             "Switzerland_CA_USD": "CHE/BN.CAB.XOKA.CD",
+             "Poland_CA_USD":      "POL/BN.CAB.XOKA.CD",
+             "Ireland_CA_USD":     "IRL/BN.CAB.XOKA.CD",
+             "Belgium_CA_USD":     "BEL/BN.CAB.XOKA.CD",
+             "Sweden_CA_USD":      "SWE/BN.CAB.XOKA.CD",
+             "Israel_CA_USD":      "ISR/BN.CAB.XOKA.CD",
+             "Argentina_CA_USD":   "ARG/BN.CAB.XOKA.CD",
+             "Singapore_CA_USD":   "SGP/BN.CAB.XOKA.CD",
+             "Austria_CA_USD":     "AUT/BN.CAB.XOKA.CD",
+             "UAE_CA_USD":         "ARE/BN.CAB.XOKA.CD",
+             "Taiwan_CA_USD":      "TWN/BN.CAB.XOKA.CD",
+             # Current Account as % of GDP
+             "US_CA_PctGDP":           "USA/BN.CAB.XOKA.GD.ZS",
+             "China_CA_PctGDP":       "CHN/BN.CAB.XOKA.GD.ZS",
+             "Germany_CA_PctGDP":     "DEU/BN.CAB.XOKA.GD.ZS",
+             "Japan_CA_PctGDP":       "JPN/BN.CAB.XOKA.GD.ZS",
+             "UK_CA_PctGDP":          "GBR/BN.CAB.XOKA.GD.ZS",
+             "India_CA_PctGDP":       "IND/BN.CAB.XOKA.GD.ZS",
+             "France_CA_PctGDP":      "FRA/BN.CAB.XOKA.GD.ZS",
+             "Italy_CA_PctGDP":       "ITA/BN.CAB.XOKA.GD.ZS",
+             "Russia_CA_PctGDP":      "RUS/BN.CAB.XOKA.GD.ZS",
+             "Brazil_CA_PctGDP":      "BRA/BN.CAB.XOKA.GD.ZS",
+             "Canada_CA_PctGDP":      "CAN/BN.CAB.XOKA.GD.ZS",
+             "Australia_CA_PctGDP":   "AUS/BN.CAB.XOKA.GD.ZS",
+             "Mexico_CA_PctGDP":      "MEX/BN.CAB.XOKA.GD.ZS",
+             "Spain_CA_PctGDP":       "ESP/BN.CAB.XOKA.GD.ZS",
+             "SKorea_CA_PctGDP":      "KOR/BN.CAB.XOKA.GD.ZS",
+             "Turkey_CA_PctGDP":      "TUR/BN.CAB.XOKA.GD.ZS",
+             "Indonesia_CA_PctGDP":   "IDN/BN.CAB.XOKA.GD.ZS",
+             "Netherlands_CA_PctGDP": "NLD/BN.CAB.XOKA.GD.ZS",
+             "SaudiArabia_CA_PctGDP": "SAU/BN.CAB.XOKA.GD.ZS",
+             "Switzerland_CA_PctGDP": "CHE/BN.CAB.XOKA.GD.ZS",
+             "Poland_CA_PctGDP":      "POL/BN.CAB.XOKA.GD.ZS",
+             "Ireland_CA_PctGDP":     "IRL/BN.CAB.XOKA.GD.ZS",
+             "Belgium_CA_PctGDP":     "BEL/BN.CAB.XOKA.GD.ZS",
+             "Sweden_CA_PctGDP":      "SWE/BN.CAB.XOKA.GD.ZS",
+             "Israel_CA_PctGDP":      "ISR/BN.CAB.XOKA.GD.ZS",
+             "Argentina_CA_PctGDP":   "ARG/BN.CAB.XOKA.GD.ZS",
+             "Singapore_CA_PctGDP":   "SGP/BN.CAB.XOKA.GD.ZS",
+             "Austria_CA_PctGDP":     "AUT/BN.CAB.XOKA.GD.ZS",
+             "UAE_CA_PctGDP":         "ARE/BN.CAB.XOKA.GD.ZS",
+             "Taiwan_CA_PctGDP":      "TWN/BN.CAB.XOKA.GD.ZS",
+         }, "priority": 1,
+          "note": "World Bank API (NO KEY). 30 countries × 2 metrics (USD + %GDP). "
+                  "Annual since ~1970. Positive = surplus, negative = deficit."},
+     ], "metadata": {"Asset Class": "Macro — Balance of Payments",
+                     "Region": "Top 30 GDP countries", "Currency": "USD / % of GDP"}},
+
+    # ==================================================================
+    # 28. DEFENSE_SPENDING — Military Expenditure 30 Countries
+    # ==================================================================
+    # Military spending as % of GDP and in current USD. Geopolitical risk
+    # indicator — rising defense spending correlates with geopolitical
+    # tension, which affects commodity prices, FX, and risk premiums.
+    #
+    # World Bank: MS.MIL.XPND.CD    — Military expenditure (current USD)
+    #             MS.MIL.XPND.GD.ZS — Military expenditure (% of GDP)
+    # Source: Stockholm International Peace Research Institute (SIPRI)
+    # Annual since 1960 for most countries (66 years!).
+    {"name": "DEFENSE_SPENDING",
+     "description": "Military Expenditure — 30 Countries in USD + % of GDP (Annual since 1960, SIPRI)",
+     "group": "macro", "unit": "current USD / % of GDP", "frequency": "annual",
+     "sources": [
+         {"type": "worldbank", "series": {
+             # Military Expenditure in current USD
+             "US_Defense_USD":           "USA/MS.MIL.XPND.CD",
+             "China_Defense_USD":       "CHN/MS.MIL.XPND.CD",
+             "Germany_Defense_USD":     "DEU/MS.MIL.XPND.CD",
+             "Japan_Defense_USD":       "JPN/MS.MIL.XPND.CD",
+             "UK_Defense_USD":          "GBR/MS.MIL.XPND.CD",
+             "India_Defense_USD":       "IND/MS.MIL.XPND.CD",
+             "France_Defense_USD":      "FRA/MS.MIL.XPND.CD",
+             "Italy_Defense_USD":       "ITA/MS.MIL.XPND.CD",
+             "Russia_Defense_USD":      "RUS/MS.MIL.XPND.CD",
+             "Brazil_Defense_USD":      "BRA/MS.MIL.XPND.CD",
+             "Canada_Defense_USD":      "CAN/MS.MIL.XPND.CD",
+             "Australia_Defense_USD":   "AUS/MS.MIL.XPND.CD",
+             "Mexico_Defense_USD":      "MEX/MS.MIL.XPND.CD",
+             "Spain_Defense_USD":       "ESP/MS.MIL.XPND.CD",
+             "SKorea_Defense_USD":      "KOR/MS.MIL.XPND.CD",
+             "Turkey_Defense_USD":      "TUR/MS.MIL.XPND.CD",
+             "Indonesia_Defense_USD":   "IDN/MS.MIL.XPND.CD",
+             "Netherlands_Defense_USD": "NLD/MS.MIL.XPND.CD",
+             "SaudiArabia_Defense_USD": "SAU/MS.MIL.XPND.CD",
+             "Switzerland_Defense_USD": "CHE/MS.MIL.XPND.CD",
+             "Poland_Defense_USD":      "POL/MS.MIL.XPND.CD",
+             "Ireland_Defense_USD":     "IRL/MS.MIL.XPND.CD",
+             "Belgium_Defense_USD":     "BEL/MS.MIL.XPND.CD",
+             "Sweden_Defense_USD":      "SWE/MS.MIL.XPND.CD",
+             "Israel_Defense_USD":      "ISR/MS.MIL.XPND.CD",
+             "Argentina_Defense_USD":   "ARG/MS.MIL.XPND.CD",
+             "Singapore_Defense_USD":   "SGP/MS.MIL.XPND.CD",
+             "Austria_Defense_USD":     "AUT/MS.MIL.XPND.CD",
+             "UAE_Defense_USD":         "ARE/MS.MIL.XPND.CD",
+             "Taiwan_Defense_USD":      "TWN/MS.MIL.XPND.CD",
+             # Military Expenditure as % of GDP
+             "US_Defense_PctGDP":           "USA/MS.MIL.XPND.GD.ZS",
+             "China_Defense_PctGDP":       "CHN/MS.MIL.XPND.GD.ZS",
+             "Germany_Defense_PctGDP":     "DEU/MS.MIL.XPND.GD.ZS",
+             "Japan_Defense_PctGDP":       "JPN/MS.MIL.XPND.GD.ZS",
+             "UK_Defense_PctGDP":          "GBR/MS.MIL.XPND.GD.ZS",
+             "India_Defense_PctGDP":       "IND/MS.MIL.XPND.GD.ZS",
+             "France_Defense_PctGDP":      "FRA/MS.MIL.XPND.GD.ZS",
+             "Italy_Defense_PctGDP":       "ITA/MS.MIL.XPND.GD.ZS",
+             "Russia_Defense_PctGDP":      "RUS/MS.MIL.XPND.GD.ZS",
+             "Brazil_Defense_PctGDP":      "BRA/MS.MIL.XPND.GD.ZS",
+             "Canada_Defense_PctGDP":      "CAN/MS.MIL.XPND.GD.ZS",
+             "Australia_Defense_PctGDP":   "AUS/MS.MIL.XPND.GD.ZS",
+             "Mexico_Defense_PctGDP":      "MEX/MS.MIL.XPND.GD.ZS",
+             "Spain_Defense_PctGDP":       "ESP/MS.MIL.XPND.GD.ZS",
+             "SKorea_Defense_PctGDP":      "KOR/MS.MIL.XPND.GD.ZS",
+             "Turkey_Defense_PctGDP":      "TUR/MS.MIL.XPND.GD.ZS",
+             "Indonesia_Defense_PctGDP":   "IDN/MS.MIL.XPND.GD.ZS",
+             "Netherlands_Defense_PctGDP": "NLD/MS.MIL.XPND.GD.ZS",
+             "SaudiArabia_Defense_PctGDP": "SAU/MS.MIL.XPND.GD.ZS",
+             "Switzerland_Defense_PctGDP": "CHE/MS.MIL.XPND.GD.ZS",
+             "Poland_Defense_PctGDP":      "POL/MS.MIL.XPND.GD.ZS",
+             "Ireland_Defense_PctGDP":     "IRL/MS.MIL.XPND.GD.ZS",
+             "Belgium_Defense_PctGDP":     "BEL/MS.MIL.XPND.GD.ZS",
+             "Sweden_Defense_PctGDP":      "SWE/MS.MIL.XPND.GD.ZS",
+             "Israel_Defense_PctGDP":      "ISR/MS.MIL.XPND.GD.ZS",
+             "Argentina_Defense_PctGDP":   "ARG/MS.MIL.XPND.GD.ZS",
+             "Singapore_Defense_PctGDP":   "SGP/MS.MIL.XPND.GD.ZS",
+             "Austria_Defense_PctGDP":     "AUT/MS.MIL.XPND.GD.ZS",
+             "UAE_Defense_PctGDP":         "ARE/MS.MIL.XPND.GD.ZS",
+             "Taiwan_Defense_PctGDP":      "TWN/MS.MIL.XPND.GD.ZS",
+         }, "priority": 1,
+          "note": "World Bank API (NO KEY), source: SIPRI. 30 countries × 2 metrics. "
+                  "Annual since 1960. US at ~3.4% GDP, Saudi ~6%, Japan ~1%."},
+     ], "metadata": {"Asset Class": "Macro — Geopolitical / Defense",
+                     "Region": "Top 30 GDP countries", "Currency": "USD / % of GDP"}},
+
 ]
 # ===========================================================================
 
@@ -1417,27 +1891,32 @@ INDICATOR_JOBS = [
 
 GROUPS = {
     "commodities":  ["GOLD", "OIL", "SILVER", "METALS", "RARE_EARTHS",
-                     "SEMICONDUCTORS", "AGRICULTURE"],
+                     "SEMICONDUCTORS", "AGRICULTURE", "ENERGY_EXTENDED"],
     "rates":        ["BONDS", "INTEREST_RATES", "CREDIT_SPREADS", "FOREX"],
     "volatility":   ["VIX"],
     "indices":      ["EQUITY_INDICES"],
     "macro":        ["GOV_DEBT_LEVEL", "WORLD_LEVERAGE", "DEMOGRAPHICS",
                      "HOUSEHOLD_ALLOCATION", "INFLATION", "REAL_ESTATE",
                      "EMPLOYMENT", "GDP_GROWTH", "CONSUMER_SENTIMENT",
-                     "SHIPPING_TRADE"],
+                     "SHIPPING_TRADE", "COUNTRY_DEBT", "EARNINGS_VALUATIONS",
+                     "CURRENT_ACCOUNT", "DEFENSE_SPENDING"],
     "phase1":       ["GOLD", "BONDS", "VIX", "OIL"],
     "phase2":       ["SILVER", "METALS", "INTEREST_RATES"],
     "phase3":       ["CREDIT_SPREADS", "GOV_DEBT_LEVEL", "WORLD_LEVERAGE", "RARE_EARTHS"],
     "phase4":       ["SEMICONDUCTORS", "DEMOGRAPHICS", "HOUSEHOLD_ALLOCATION", "FOREX"],
     "phase5":       ["INFLATION", "REAL_ESTATE", "EMPLOYMENT", "AGRICULTURE"],
     "phase6":       ["GDP_GROWTH", "EQUITY_INDICES", "CONSUMER_SENTIMENT", "SHIPPING_TRADE"],
+    "phase7":       ["COUNTRY_DEBT"],
+    "phase8":       ["EARNINGS_VALUATIONS", "ENERGY_EXTENDED", "CURRENT_ACCOUNT", "DEFENSE_SPENDING"],
     "all":          ["GOLD", "BONDS", "VIX", "OIL", "SILVER", "METALS",
                      "INTEREST_RATES", "CREDIT_SPREADS", "GOV_DEBT_LEVEL",
                      "WORLD_LEVERAGE", "RARE_EARTHS", "SEMICONDUCTORS",
                      "DEMOGRAPHICS", "HOUSEHOLD_ALLOCATION", "FOREX",
                      "INFLATION", "REAL_ESTATE", "EMPLOYMENT", "AGRICULTURE",
                      "GDP_GROWTH", "EQUITY_INDICES", "CONSUMER_SENTIMENT",
-                     "SHIPPING_TRADE"],
+                     "SHIPPING_TRADE", "COUNTRY_DEBT",
+                     "EARNINGS_VALUATIONS", "ENERGY_EXTENDED",
+                     "CURRENT_ACCOUNT", "DEFENSE_SPENDING"],
 }
 
 
@@ -1470,6 +1949,11 @@ TAB_NAMES = {
     "EQUITY_INDICES":        "Equity Indices",
     "CONSUMER_SENTIMENT":    "Sentiment & PMI",
     "SHIPPING_TRADE":        "Trade & Shipping",
+    "COUNTRY_DEBT":          "Govt Debt USD 30 Countries",
+    "EARNINGS_VALUATIONS":   "Valuations & Profits",
+    "ENERGY_EXTENDED":       "Energy Gas Coal Uranium",
+    "CURRENT_ACCOUNT":       "Current Account 30 Countries",
+    "DEFENSE_SPENDING":      "Defense Spending 30 Countries",
 }
 
 
@@ -1478,172 +1962,111 @@ TAB_NAMES = {
 # ===========================================================================
 
 def merge_to_excel(job_names: list = None):
-    """Read all indicator CSVs from OUTPUT_DIR and write them as tabs in one Excel.
+    """Write all stored indicator DataFrames as tabs in one Excel workbook.
 
-    Each tab = one indicator's CSV, named with the human-readable TAB_NAMES.
-    Also adds a 'Summary' tab as the first sheet with an overview of all indicators.
+    Reads from _INDICATOR_FRAMES (populated by save_indicator during the run).
+    Each tab = one indicator, named with the human-readable TAB_NAMES.
+    First sheet = Summary overview.
 
     Args:
-        job_names: list of indicator names that were just extracted.
-                   If None, scans OUTPUT_DIR for all matching CSVs.
+        job_names: list of indicator names to include. If None, uses all stored.
     """
-    import glob
-
-    # Find all indicator CSVs in output/
-    csv_pattern = os.path.join(OUTPUT_DIR, "*_series_*_days.csv")
-    all_csvs = sorted(glob.glob(csv_pattern))
-
-    if not all_csvs:
-        log.warning("  No indicator CSVs found in output/ — skipping Excel merge.")
+    if not _INDICATOR_FRAMES:
+        log.warning("  No indicator data in memory — nothing to merge.")
         return None
 
-    # If job_names provided, filter to only those (keeps order)
+    # Determine which indicators to write
     if job_names:
-        name_set = set(job_names)
-        filtered = []
-        for csv_path in all_csvs:
-            basename = os.path.basename(csv_path)
-            # Extract indicator name from filename: NAME_N_series_N_days.csv
-            indicator_name = basename.split("_")[0]
-            # Handle multi-word names like CREDIT_SPREADS, RARE_EARTHS etc.
-            for name in name_set:
-                if basename.startswith(name + "_"):
-                    filtered.append((name, csv_path))
-                    break
-        csv_files = filtered
+        names_to_write = [n for n in job_names if n in _INDICATOR_FRAMES]
     else:
-        # Auto-detect from all CSVs
-        csv_files = []
-        for csv_path in all_csvs:
-            basename = os.path.basename(csv_path)
-            # Try to match against known indicator names
-            matched = False
-            for name in TAB_NAMES:
-                if basename.startswith(name + "_"):
-                    csv_files.append((name, csv_path))
-                    matched = True
-                    break
-            if not matched:
-                # Use the part before first digit-underscore as name
-                parts = basename.replace("_series_", "|").split("|")[0]
-                csv_files.append((parts, csv_path))
+        names_to_write = list(_INDICATOR_FRAMES.keys())
 
-    if not csv_files:
-        log.warning("  No matching indicator CSVs found — skipping Excel merge.")
+    if not names_to_write:
+        log.warning("  No matching indicator data found — skipping Excel.")
         return None
 
     log.info(f"\n{'='*60}")
-    log.info(f"MERGING {len(csv_files)} indicators into single Excel workbook")
+    log.info(f"WRITING {len(names_to_write)} indicators to Excel workbook")
     log.info(f"{'='*60}")
 
-    # Build the merged Excel
     today_str = datetime.today().strftime("%Y-%m-%d")
     excel_path = os.path.join(OUTPUT_DIR,
-                              f"ALL_INDICATORS_{len(csv_files)}_tabs_{today_str}.xlsx")
+                              f"ALL_INDICATORS_{len(names_to_write)}_tabs_{today_str}.xlsx")
 
-    # Build summary data as we go
     summary_rows = []
 
     try:
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-
-            # Reserve first sheet for summary (written last, inserted first)
             tabs_written = 0
 
-            for indicator_name, csv_path in csv_files:
+            for indicator_name in names_to_write:
                 tab_name = TAB_NAMES.get(indicator_name, indicator_name[:31])
+                df = _INDICATOR_FRAMES[indicator_name]
+
+                if df.empty:
+                    continue
 
                 try:
-                    df = pd.read_csv(csv_path, index_col=0)
-
-                    if df.empty:
-                        log.warning(f"    {indicator_name}: CSV is empty, skipping tab")
-                        continue
-
-                    # Extract metadata columns vs date columns
-                    # Date columns start with "19" or "20" (YYYY-MM-DD format)
-                    date_cols = [c for c in df.columns if c[:2] in ("19", "20")]
-                    meta_cols = [c for c in df.columns if c not in date_cols]
+                    # Count date columns vs metadata
+                    date_cols = [c for c in df.columns
+                                 if isinstance(c, str) and len(c) >= 4
+                                 and c[:2] in ("19", "20") and "-" in c]
                     n_series = len(df)
                     n_days = len(date_cols)
-
-                    # Collect summary info
-                    if date_cols:
-                        first_date = date_cols[0]
-                        last_date = date_cols[-1]
-                    else:
-                        first_date = last_date = "N/A"
+                    first_date = date_cols[0] if date_cols else "N/A"
+                    last_date = date_cols[-1] if date_cols else "N/A"
 
                     summary_rows.append({
-                        "Tab": tab_name,
-                        "Indicator": indicator_name,
-                        "Series": n_series,
-                        "Days": n_days,
-                        "First Date": first_date,
-                        "Last Date": last_date,
-                        "CSV File": os.path.basename(csv_path),
+                        "Tab": tab_name, "Indicator": indicator_name,
+                        "Series": n_series, "Days": n_days,
+                        "First Date": first_date, "Last Date": last_date,
                     })
 
-                    # Write the indicator data to its tab
                     df.to_excel(writer, sheet_name=tab_name, index=True,
                                 index_label="Series", freeze_panes=(1, 1))
-
                     tabs_written += 1
                     log.info(f"    Tab '{tab_name}': {n_series} series x {n_days} days")
 
                 except Exception as e:
-                    log.warning(f"    {indicator_name}: failed to write tab — {e}")
+                    log.warning(f"    {indicator_name}: failed — {e}")
                     summary_rows.append({
                         "Tab": tab_name, "Indicator": indicator_name,
                         "Series": 0, "Days": 0,
                         "First Date": "ERROR", "Last Date": str(e)[:40],
-                        "CSV File": os.path.basename(csv_path),
                     })
 
-            # Write the Summary tab
+            # Write Summary tab
             if summary_rows:
-                summary_df = pd.DataFrame(summary_rows)
-                summary_df.index = range(1, len(summary_df) + 1)
-                summary_df.index.name = "#"
+                sdf = pd.DataFrame(summary_rows)
+                sdf.index = range(1, len(sdf) + 1)
+                sdf.index.name = "#"
 
-                # Add totals row
                 totals = pd.DataFrame([{
                     "Tab": "TOTAL",
                     "Indicator": f"{tabs_written} indicators",
-                    "Series": summary_df["Series"].sum(),
-                    "Days": "",
-                    "First Date": summary_df[summary_df["First Date"] != "ERROR"]["First Date"].min()
-                                  if not summary_df.empty else "",
-                    "Last Date":  summary_df[summary_df["Last Date"].str.match(r"^\d{4}", na=False)]["Last Date"].max()
-                                  if not summary_df.empty else "",
-                    "CSV File": "",
-                }], index=[len(summary_df) + 1])
+                    "Series": sdf["Series"].sum(),
+                    "Days": "", "First Date": "", "Last Date": "",
+                }], index=[len(sdf) + 1])
                 totals.index.name = "#"
-                summary_df = pd.concat([summary_df, totals])
+                sdf = pd.concat([sdf, totals])
 
-                summary_df.to_excel(writer, sheet_name="Summary", index=True)
+                sdf.to_excel(writer, sheet_name="Summary", index=True)
 
-                # Move Summary to first position
                 wb = writer.book
                 summary_sheet = wb["Summary"]
                 wb.move_sheet(summary_sheet, offset=-(len(wb.sheetnames) - 1))
 
-                # Auto-size Summary columns
                 for col_cells in summary_sheet.columns:
-                    max_len = 0
-                    col_letter = col_cells[0].column_letter
-                    for cell in col_cells:
-                        if cell.value:
-                            max_len = max(max_len, len(str(cell.value)))
-                    summary_sheet.column_dimensions[col_letter].width = min(max_len + 3, 50)
+                    max_len = max((len(str(c.value or "")) for c in col_cells), default=8)
+                    summary_sheet.column_dimensions[col_cells[0].column_letter].width = min(max_len + 3, 50)
 
-        log.info(f"\n  MERGED EXCEL SAVED: {excel_path}")
+        log.info(f"\n  EXCEL SAVED: {excel_path}")
         log.info(f"    {tabs_written} indicator tabs + 1 Summary tab")
         log.info(f"    Total: {sum(r['Series'] for r in summary_rows if isinstance(r['Series'], int))} series")
         return excel_path
 
     except Exception as e:
-        log.error(f"  Excel merge failed: {e}")
+        log.error(f"  Excel write failed: {e}")
         return None
 
 
@@ -1670,6 +2093,8 @@ def extract_indicator(job):
             df = fetch_yfinance_series(series, START_DATE, END_DATE)
         elif st == "worldbank":
             df = fetch_worldbank_series(series, START_DATE, END_DATE)
+        elif st == "worldbank_debt":
+            df = fetch_worldbank_debt_usd(series, START_DATE, END_DATE)
         if not df.empty:
             all_frames.append(df)
             log.info(f"    Got {df.shape[1]} series x {len(df)} days")
@@ -1874,16 +2299,17 @@ def save_indicator(job, df):
     n_yearly = len(yearly_df.columns)
     n_daily  = len(df_wide.columns)
 
-    fn = os.path.join(OUTPUT_DIR, f"{name}_{df.shape[1]}_series_{len(df)}_days.csv")
-    out.to_csv(fn, index_label="Series")
-    log.info(f"\n  SAVED: {fn}")
+    # Store in memory (merge_to_excel reads from here — no CSV files)
+    _INDICATOR_FRAMES[name] = out
+
+    log.info(f"\n  STORED: {name}")
     log.info(f"    {df.shape[1]} series x {n_daily} daily dates")
     log.info(f"    + {n_sd} SD columns (basis + 6 frequencies)")
     log.info(f"    + {n_yearly} yearly overview columns ({yearly_cols[0]}-{yearly_cols[-1]})"
              if yearly_cols else "    + 0 yearly columns")
     log.info(f"    + {n_meta} metadata cols + 4 separator cols")
     save_indicator_cache(name, {"last_fetched": datetime.today().strftime("%Y-%m-%d %H:%M:%S"),
-        "series_count": df.shape[1], "day_count": len(df), "file_path": fn,
+        "series_count": df.shape[1], "day_count": len(df),
         "date_range": f"{df.index.min().date()} -> {df.index.max().date()}"})
 
 def print_summary(results):
@@ -1895,7 +2321,7 @@ def print_summary(results):
                  f"{r['date_range']:<30} {'OK' if r['success'] else 'FAIL'}")
     log.info(f"\n  Total: {sum(1 for r in results if r['success'])}/{len(results)} OK")
 
-def run_all(jobs, merge=True):
+def run_all(jobs):
     results = []
     extracted_names = []
     for i, job in enumerate(jobs, 1):
@@ -1912,33 +2338,29 @@ def run_all(jobs, merge=True):
                             "date_range": "N/A"})
         if i < len(jobs): time.sleep(INTER_INDICATOR_DELAY)
     print_summary(results)
-
-    # Merge all extracted CSVs into a single Excel workbook
-    if merge and extracted_names:
+    if extracted_names:
         merge_to_excel(extracted_names)
-
     return results
 
-def run_group(g, merge=True):
+def run_group(g):
     g = g.lower()
     if g not in GROUPS:
         log.error(f"Unknown group '{g}'. Available: {list(GROUPS.keys())}"); return
     jobs = [j for j in INDICATOR_JOBS if j["name"] in GROUPS[g]]
     log.info(f"Group '{g}': {len(jobs)} indicators -> {GROUPS[g]}")
-    run_all(jobs, merge=merge)
+    run_all(jobs)
 
-def run_single(name, merge=True):
+def run_single(name):
     m = [j for j in INDICATOR_JOBS if j["name"].lower() == name.lower()]
     if not m:
         log.error(f"'{name}' not found. Available: {[j['name'] for j in INDICATOR_JOBS]}"); return
     df = extract_indicator(m[0])
     if not df.empty:
         save_indicator(m[0], df)
-        if merge:
-            merge_to_excel([m[0]["name"]])
+        merge_to_excel([m[0]["name"]])
 
 def list_indicators():
-    print(f"\n{'='*75}\nAVAILABLE INDICATORS v6 — {len(INDICATOR_JOBS)} active\n{'='*75}\n")
+    print(f"\n{'='*75}\nAVAILABLE INDICATORS v8 — {len(INDICATOR_JOBS)} active\n{'='*75}\n")
     for j in INDICATOR_JOBS:
         src = " + ".join(s["type"] for s in j["sources"])
         ns = sum(len(s["series"]) for s in j["sources"])
@@ -1948,37 +2370,31 @@ def list_indicators():
     for g, ns in GROUPS.items(): print(f"  {g:<15} -> {ns}")
     print(f"\nFRED: {'SET' if FRED_API_KEY else 'NOT SET'} "
           f"(free: https://fred.stlouisfed.org/docs/api/api_key.html)\n")
+    print(f"Output: single Excel workbook in {OUTPUT_DIR}/\n")
 
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(
-        description="Global Indicator Data Extractor v6 — 23 Indicators",
+        description="Global Indicator Data Extractor v8 — 28 Indicators → Single Excel",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="Examples:\n"
-               "  python extract_indicator_data.py                          # all 23 + merged Excel\n"
-               "  python extract_indicator_data.py --group phase6           # 4 newest + merged Excel\n"
-               "  python extract_indicator_data.py --indicator GDP_GROWTH   # single + merged Excel\n"
-               "  python extract_indicator_data.py --no-merge               # all 23, CSVs only\n"
-               "  python extract_indicator_data.py --group commodities      # 7 indicators\n"
-               "  python extract_indicator_data.py --group macro            # 10 indicators\n"
-               "  python extract_indicator_data.py --merge-only             # skip extraction, just merge existing CSVs\n"
-               "  python extract_indicator_data.py --list\n")
+               "  python extract_indicator_data.py                          # all 24 → Excel\n"
+               "  python extract_indicator_data.py --indicator COUNTRY_DEBT # single → Excel\n"
+               "  python extract_indicator_data.py --indicator GDP_GROWTH   # GDP top 30\n"
+               "  python extract_indicator_data.py --group macro            # macro group → Excel\n"
+               "  python extract_indicator_data.py --group commodities\n"
+               "  python extract_indicator_data.py --list\n"
+               "\nOutput: single ALL_INDICATORS_*.xlsx in output/ (no separate CSVs)\n")
     p.add_argument("--indicator", type=str, help="Single indicator name")
-    p.add_argument("--group", type=str, help="Group: commodities|rates|volatility|indices|macro|phase1-6|all")
+    p.add_argument("--group", type=str, help="Group: commodities|rates|volatility|indices|macro|phase1-7|all")
     p.add_argument("--list", action="store_true", help="List all indicators")
-    p.add_argument("--no-merge", action="store_true",
-                   help="Skip the merged Excel workbook (CSVs only)")
-    p.add_argument("--merge-only", action="store_true",
-                   help="Skip extraction — just merge existing output/ CSVs into Excel")
     args = p.parse_args()
 
     if args.list:
         list_indicators()
-    elif args.merge_only:
-        merge_to_excel()
     elif args.indicator:
-        run_single(args.indicator, merge=not args.no_merge)
+        run_single(args.indicator)
     elif args.group:
-        run_group(args.group, merge=not args.no_merge)
+        run_group(args.group)
     else:
-        run_all(INDICATOR_JOBS, merge=not args.no_merge)
+        run_all(INDICATOR_JOBS)
